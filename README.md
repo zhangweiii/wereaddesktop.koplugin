@@ -65,6 +65,16 @@ cd wereaddesktop.koplugin
 KOREADER_DIR=/path/to/koreader luajit spec/smoke_settings_merge.lua
 luajit spec/test_progress_sync.lua
 luajit spec/test_posupdate_wiring.lua
+luajit spec/test_updater.lua
+```
+
+更新器的真实解压测试需要一个已经构建好的 KOReader 运行目录：
+
+```sh
+PLUGIN_DIR=/absolute/path/to/wereaddesktop.koplugin
+(cd /path/to/koreader-runtime && \
+    env PLUGIN_DIR="$PLUGIN_DIR" \
+    ./luajit "$PLUGIN_DIR/spec/test_updater_install.lua")
 ```
 
 `spec/e2e_real_upload.lua`、`spec/e2e_cloud_pull.lua` 和 `spec/e2e_read_time.lua` 是针对真实账号的端到端脚本，会读写真实服务器数据，仅供手动调试使用，用法见文件头注释。

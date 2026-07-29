@@ -2,9 +2,9 @@
 # Build the release tarball for 微读 (wereaddesktop.koplugin).
 #
 # The plugin's self-updater (updater.lua) downloads the .tar.gz asset
-# attached to a GitHub release and unpacks it over the plugins/
-# directory, so the tarball MUST have wereaddesktop.koplugin/ as its
-# single top-level entry.
+# attached to a GitHub release, extracts it into a staging directory,
+# validates it, and then replaces the live plugin directory. The tarball
+# MUST therefore have wereaddesktop.koplugin/ as its single top-level entry.
 #
 # Usage (from the repo root):
 #   sh tools/release.sh            # -> dist/wereaddesktop.koplugin-v<version>.tar.gz
