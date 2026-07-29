@@ -1,0 +1,30 @@
+微读 (WeRead Desktop) — KOReader 微信读书桌面插件
+Copyright (C) 2026 zhangweiii and contributors
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version. See LICENSE for the complete license
+text.
+
+Third-party material:
+
+- wereaddesktop.koplugin/weread/
+  Derived from "WeRead KOReader Plugin" (weread.koplugin)
+  Copyright (C) 2026 finlater and contributors
+  Licensed under the GNU Affero General Public License version 3.
+  Source: https://github.com/finlater/weread.koplugin
+  Files in this directory carry local modifications: unused upstream
+  code has been removed (the MP article pipeline, the legacy
+  per-chapter download pipeline, and the related APIs, settings and
+  translations), plugin_util.lua has been dropped, and client.lua,
+  settings.lua and ui/download_dialog.lua carry functional changes.
+
+Disclaimer:
+
+This is an unofficial project. It is not affiliated with, endorsed by,
+or sponsored by WeRead, Tencent, or KOReader. All product names and
+trademarks belong to their respective owners. The plugin talks to
+weread.qq.com through the same gateways as the official reader and is
+intended for personal reading use only; you are responsible for your
+own account, data and device.

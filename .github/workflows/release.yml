@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release tarball
+        run: sh tools/release.sh
+
+      - name: Parse version
+        id: version
+        run: |
+          V=$(sed -n 's/^return "\(.*\)"$/\1/p' wereaddesktop.koplugin/wereaddesktop_version.lua)
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.version.outputs.value }}
+          files: dist/wereaddesktop.koplugin-v${{ steps.version.outputs.value }}.tar.gz
+          generate_release_notes: true

@@ -1,0 +1,9 @@
+*.old
+*.bak
+.DS_Store
+# 发布用的宣传截图，需要提交到仓库；运行时截图在 KOReader 自己的目录下
+# screenshots/
+
+# KOReader 运行时数据（settings/weread.lua 含登录 cookie），只产生于设备/模拟器目录，防止误提交
+settings/
+weread.lua
