@@ -53,6 +53,7 @@ local defaults = {
     shelf = {
         sort_order = "time_desc",
     },
+    pending_finish_sync = {},
     download_dir = "",
 }
 

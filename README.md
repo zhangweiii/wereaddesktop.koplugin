@@ -1,6 +1,6 @@
 # 微读 (WeRead Desktop)
 
-把微信读书搬到 KOReader 桌面：启动即是你的微信书架，支持扫码登录、书城浏览、全书下载和双向阅读进度/时长云同步。适用于 Kindle 及其他运行 KOReader 的设备。
+把微信读书搬到 KOReader 桌面：启动即是你的微信书架，支持扫码登录、书城浏览、全书下载、划线评论，以及阅读进度、时长和已读状态云同步。适用于 Kindle 及其他运行 KOReader 的设备。
 
 ## 功能
 
@@ -8,9 +8,13 @@
 - **扫码登录**：与微信读书官方 App 相同的二维码登录方式
 - **书城**：浏览书城推荐、搜索书籍
 - **全书下载**：把书架上的书打包成单个 EPUB 下载到本地阅读
+- **划线与书友想法**：下载微信读书划线；点击任一下划线按需加载当前范围的书友想法，已知有评论的位置带星号，并支持缓存和「加载更多」
+- **书友点评**：阅读微信书籍时可从 KOReader 工具菜单查看整本书的精选点评
+- **出版社注释**：将书中出版社注释转换为标准 EPUB 脚注，点击后使用 KOReader 原生弹窗显示
 - **双向进度同步**：
-  - 上传：阅读中每 60 秒、打开/关闭书籍时自动上报进度和阅读时长
+  - 上传：阅读中每 30 秒、打开/关闭书籍时自动上报进度和有效阅读时长；休眠时间不会计入
   - 下载：打开书时自动拉取云端进度，比本地新就跳转到最新位置（在手机微信读书上读的进度可以无缝接续）
+- **已读状态同步**：KOReader 读完弹窗中的「标记为读完/继续阅读」同步到微信读书云端；离线或失败时保留状态并在联网后重试
 - **状态栏**：时间、Wi-Fi 状态、设置和退出入口
 - **定时熄屏**：设置标签页可调整无操作自动休眠时长（关 / 5 / 15 / 30 / 60 分钟，复用 KOReader 内置 autosuspend 插件，默认 15 分钟）
 - **设备快捷设置**：设置标签页提供前光（亮度/色温）、夜间模式、Wi-Fi、屏幕旋转、屏保类型、时钟格式（12/24 小时制）开关，全部走 KOReader 官方公开接口；顶部显示电量和存储状态
@@ -26,6 +30,7 @@
 <p align="center">
   <img src="screenshots/download.png" width="32%" alt="下载">
   <img src="screenshots/login.png" width="32%" alt="登录">
+  <img src="screenshots/comments.png" width="32%" alt="书友想法">
 </p>
 
 ## 安装
@@ -41,6 +46,9 @@
 - **书架**：点封面打开已下载的书；未下载的书会提示下载整本 EPUB；长按封面弹出下载选项（补齐缺失章节 / 重新下载整本）
 - **书城**：底部「书城」标签浏览推荐和搜索，搜索到的书同样可以下载
 - **下载补齐**：整本下载时部分章节失败，完成提示里可直接「补齐缺失章节」——只重下失败的章节并重新打包，已下载的章节来自本地缓存
+- **划线评论**：点击橙色下划线打开「书友想法」；带星号表示已知存在公开评论，普通热门划线也可点击，无评论时会显示空状态。评论按当前范围懒加载，不会在下载整本书时批量请求
+- **整本点评**：阅读微信书籍时，从 KOReader 主菜单「工具 → 书友点评」查看整本书精选点评
+- **标记读完**：读到书末后使用 KOReader 的读完弹窗，状态会同步到微信读书；同步失败会保留待办并在重新联网或再次打开书籍时重试
 - **设置**：底部「设置」标签或右上角齿轮打开 KOReader 设置菜单；「微读」菜单项在 KOReader 主菜单的「工具」分类下，可开关自动桌面、进度同步、登录/退出
 - **进度同步**：默认开启，可在「微读」菜单中关闭
 
@@ -54,7 +62,7 @@ wereaddesktop.koplugin/
 ├── desktop.lua           -- 书架桌面 widget（书架/书城/设置三个标签页）
 ├── wereadbridge.lua      -- UI 与微信读书客户端库之间的桥接层
 ├── progressuploader.lua  -- 阅读进度双向同步（阅读器上下文）
-├── weread/               -- 微信读书协议/下载客户端库（衍生自 weread.koplugin，见 NOTICE）
+├── weread/               -- 微信读书协议、下载、划线与评论客户端库（衍生自 weread.koplugin，见 NOTICE）
 └── spec/                 -- 无头测试（luajit 直接运行）
 ```
 
@@ -65,6 +73,9 @@ cd wereaddesktop.koplugin
 KOREADER_DIR=/path/to/koreader luajit spec/smoke_settings_merge.lua
 luajit spec/test_progress_sync.lua
 luajit spec/test_posupdate_wiring.lua
+luajit spec/test_lazy_thoughts.lua
+luajit spec/test_lazy_thought_reader.lua
+luajit spec/test_finish_status_sync.lua
 luajit spec/test_updater.lua
 ```
 
@@ -96,4 +107,4 @@ PLUGIN_DIR=/absolute/path/to/wereaddesktop.koplugin
 
 ## 免责声明
 
-本项目是非官方第三方工具，与微信读书、腾讯及 KOReader 官方无任何隶属关系。插件通过与官方阅读器相同的网关访问 weread.qq.com，仅供个人阅读使用。使用者应自行承担账号、数据和设备相关风险。
+本项目是非官方第三方工具，与微信读书、腾讯及 KOReader 官方无任何隶属关系。插件通过微信读书 Web 阅读器相关接口访问 weread.qq.com，仅供个人阅读使用；相关接口未公开，可能随服务端调整而变化。使用者应自行承担账号、数据和设备相关风险。

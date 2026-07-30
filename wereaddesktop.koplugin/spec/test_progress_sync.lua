@@ -191,8 +191,9 @@ end
 
 ----------------------------------------------------------------
 -- 2. onPageUpdate only records the position; the heartbeat timer is
---    what uploads (the server silently drops rt > 60, so rt is the
---    sub-minute heartbeat interval, clamped to 60).
+--    what uploads. WeRead's rt is the active reading time not yet
+--    reported, capped at 60 seconds because larger values are silently
+--    ignored even when the endpoint responds with succ=1.
 ----------------------------------------------------------------
 do
     local uploader, _, client, state = make_uploader()
@@ -200,12 +201,12 @@ do
     local baseline = #client.calls -- 2 (enter + read)
 
     -- Heartbeat with no page turn still uploads (reading-time credit);
-    -- rt is the elapsed time since the open report.
+    -- rt is the elapsed active time since this document session opened.
     clock.t = clock.t + 45
     tick(uploader)
     check("heartbeat uploads even without a page turn",
         #client.calls == baseline + 1)
-    check("heartbeat rt is the elapsed interval (45s)",
+    check("first heartbeat reports the unreported active time (45s)",
         client.calls[#client.calls].elapsed_seconds == 45)
 
     -- Page turns never trigger network traffic themselves.
@@ -224,11 +225,35 @@ do
         and client.calls[#client.calls].progress == 70
         and client.calls[#client.calls].elapsed_seconds == 45)
 
-    -- No matter how long since the last upload, rt never exceeds 60.
+    -- A long offline/busy gap is drained in server-safe chunks. Only the
+    -- sent chunk becomes accounted, leaving the rest for later reports.
     clock.t = clock.t + 300
     tick(uploader)
-    check("rt is clamped to 60 (server drops rt > 60)",
+    check("one report never exceeds the server's 60s limit",
         client.calls[#client.calls].elapsed_seconds == 60)
+    check("only successfully sent active time is marked reported",
+        uploader.last_reported_rt == 150)
+    tick(uploader)
+    check("backlogged active time is drained in another 60s chunk",
+        client.calls[#client.calls].elapsed_seconds == 60
+        and uploader.last_reported_rt == 210)
+
+    -- Device sleep does not count as reading. A heartbeat that happens
+    -- while suspended is harmless and carries no new reading seconds.
+    local uploader2, _, client2 = make_uploader()
+    uploader2:onReaderReady(BOOK_PATH)
+    clock.t = clock.t + 30
+    tick(uploader2)
+    uploader2:onSuspend()
+    clock.t = clock.t + 600
+    tick(uploader2)
+    check("suspend time is excluded from the next rt",
+        client2.calls[#client2.calls].elapsed_seconds == 0)
+    uploader2:onResume()
+    clock.t = clock.t + 30
+    tick(uploader2)
+    check("active-time delta continues after resume",
+        client2.calls[#client2.calls].elapsed_seconds == 30)
 end
 
 ----------------------------------------------------------------
@@ -251,12 +276,28 @@ do
     check("state is reset after close",
         uploader.book_id == nil and uploader.last_position == nil)
 
-    -- Clean close (nothing new since the last upload): no extra report.
+    -- Clean close (no page turn since the last upload) must still report
+    -- the tail reading time. Otherwise every short session, and the final
+    -- partial heartbeat interval of longer sessions, is silently lost.
     local uploader2, _, client2 = make_uploader()
     uploader2:onReaderReady(BOOK_PATH)
     local baseline2 = #client2.calls
+    clock.t = clock.t + 30
     uploader2:onCloseDocument(0.5)
-    check("clean close does not re-upload", #client2.calls == baseline2)
+    check("clean close uploads final reading time",
+        #client2.calls == baseline2 + 1
+        and client2.calls[#client2.calls].elapsed_seconds == 30)
+
+    -- A close after a heartbeat reports only the active tail since that
+    -- heartbeat, so each accepted rt contributes exactly once.
+    local uploader3, _, client3 = make_uploader()
+    uploader3:onReaderReady(BOOK_PATH)
+    clock.t = clock.t + 45
+    tick(uploader3)
+    clock.t = clock.t + 30
+    uploader3:onCloseDocument(0.5)
+    check("close reports only the unreported active tail",
+        client3.calls[#client3.calls].elapsed_seconds == 30)
 end
 
 ----------------------------------------------------------------
@@ -419,20 +460,19 @@ do
 end
 
 ----------------------------------------------------------------
--- 7. Queued scheduler (like the real UIManager): the close upload's
---    task must still see its generation when it runs AFTER
---    onCloseDocument has returned — the state reset is deferred.
+-- 7. Queued scheduler (like the real UIManager): the close upload's task
+--    and retry chain keep the session alive after onCloseDocument returns.
 ----------------------------------------------------------------
 do
     local queue = {}
     local queued_scheduler = {
-        scheduleIn = function(_, _delay, fn)
-            table.insert(queue, fn)
+        scheduleIn = function(_, delay, fn)
+            table.insert(queue, { delay = delay, fn = fn })
         end,
     }
     local function run_next()
-        local fn = table.remove(queue, 1)
-        if fn then fn() end
+        local task = table.remove(queue, 1)
+        if task then task.fn() end
     end
 
     clock = { t = 100000 }
@@ -469,19 +509,19 @@ do
 end
 
 ----------------------------------------------------------------
--- 8. Heartbeat timer: armed on open, re-arms each tick, stops when the
---    document closes. Uses a queued scheduler to observe the task flow.
+-- 8. A failed close upload must retain the frozen session until its
+--    delayed retry succeeds; retry waiting time is not reading time.
 ----------------------------------------------------------------
 do
     local queue = {}
     local queued_scheduler = {
-        scheduleIn = function(_, _delay, fn)
-            table.insert(queue, fn)
+        scheduleIn = function(_, delay, fn)
+            table.insert(queue, { delay = delay, fn = fn })
         end,
     }
     local function run_next()
-        local fn = table.remove(queue, 1)
-        if fn then fn() end
+        local task = table.remove(queue, 1)
+        if task then task.fn() end
     end
 
     clock = { t = 100000 }
@@ -496,22 +536,80 @@ do
         get_fraction = function() return state.fraction end,
         is_online = function() return state.online end,
         now = now,
-        heartbeat_interval = 45,
+        heartbeat_interval = false,
+    }
+    uploader:onReaderReady(BOOK_PATH)
+    while #queue > 0 do run_next() end
+    local baseline = #client.calls
+
+    local rejected = 0
+    client.responder = function(payload)
+        if payload.__kind == "read" and rejected < 2 then
+            rejected = rejected + 1
+            return { errcode = -1 }
+        end
+        return { succ = 1 }
+    end
+    clock.t = clock.t + 50
+    uploader:onCloseDocument(0.5)
+    run_next() -- first close attempt: both direct + refreshed sends fail
+    check("close retry: session remains alive after first failure",
+        uploader.book_id == "12345" and uploader.closing == true
+        and #queue == 1)
+
+    clock.t = clock.t + 30 -- retry delay must not count as reading
+    while #queue > 0 do run_next() end
+    check("close retry: delayed retry succeeds before state reset",
+        #client.calls == baseline + 3 and uploader.book_id == nil)
+    check("close retry: reports only time read before document close",
+        client.calls[#client.calls].elapsed_seconds == 50)
+end
+
+----------------------------------------------------------------
+-- 9. Heartbeat timer: armed on open, re-arms each tick, stops when the
+--    document closes. Uses a queued scheduler to observe the task flow.
+----------------------------------------------------------------
+do
+    local queue = {}
+    local queued_scheduler = {
+        scheduleIn = function(_, delay, fn)
+            table.insert(queue, { delay = delay, fn = fn })
+        end,
+    }
+    local function run_next()
+        local task = table.remove(queue, 1)
+        if task then task.fn() end
+    end
+
+    clock = { t = 100000 }
+    local books = { ["12345"] = make_book() }
+    local settings = make_settings(books)
+    local client = make_client()
+    local state = { fraction = 0.5, online = true }
+    local uploader = ProgressUploader:new{
+        settings = settings,
+        client = client,
+        scheduler = queued_scheduler,
+        get_fraction = function() return state.fraction end,
+        is_online = function() return state.online end,
+        now = now,
     }
     uploader:onReaderReady(BOOK_PATH)
     check("heartbeat timer is armed on open", #queue == 2) -- open report + heartbeat
+    check("heartbeat timer uses official 30s cadence",
+        queue[2] and queue[2].delay == 30)
     run_next() -- open report task (queues its 0.1s send)
     run_next() -- heartbeat tick fires early in FIFO order: skipped (upload busy), re-arms
     run_next() -- the open report send
     local baseline = #client.calls
     check("open report sent", baseline == 2)
 
-    clock.t = clock.t + 45
+    clock.t = clock.t + 30
     run_next() -- heartbeat tick: queues its send, re-arms
     run_next() -- heartbeat send
     check("heartbeat uploads on the timer",
         #client.calls == baseline + 1
-        and client.calls[#client.calls].elapsed_seconds == 45)
+        and client.calls[#client.calls].elapsed_seconds == 30)
     check("heartbeat re-armed for the next tick", #queue == 1)
 
     uploader:onCloseDocument(0.5)

@@ -27,10 +27,10 @@ newer cloud progress.
 
 Uploads are heartbeat-driven, not page-turn-driven: a timer fires every
 HEARTBEAT_INTERVAL seconds while the document is open, reporting the
-latest position and the elapsed reading time (rt). The web endpoint
-silently discards the reading time of any report with rt > 60 (it still
-answers succ), so rt is always clamped to RT_CAP and the heartbeat
-interval stays below it.
+latest position and the active reading time not yet reported (rt).
+Suspend intervals are excluded. The endpoint silently ignores rt values
+above 60 despite returning succ=1, so longer backlogs are drained in
+server-safe chunks over later reports.
 
 All network calls are blocking (LuaSocket) and therefore always run
 inside scheduler-deferred tasks; failures are logged and retried
@@ -47,12 +47,12 @@ ProgressUploader.__index = ProgressUploader
 
 -- Seconds between heartbeat uploads while reading, the delay before a
 -- failed upload is retried, and how many retries one position gets.
-local HEARTBEAT_INTERVAL = 45
+local HEARTBEAT_INTERVAL = 30
 local RETRY_DELAY = 30
 local RETRY_LIMIT = 2
--- The web endpoint silently drops the reading time of any report whose
--- rt exceeds this (verified against weread.qq.com: rt=60 counts, rt=61
--- returns succ but adds nothing), so every reported rt is clamped to it.
+-- Verified against the live account: rt=62 and larger returned succ=1
+-- but did not change read stats, while preceding rt=3 and rt=31 were
+-- both credited. Never send more than 60 seconds in one report.
 local RT_CAP = 60
 -- Delay after the document is ready before the initial "reading" report.
 local OPEN_REPORT_DELAY = 1
@@ -75,6 +75,24 @@ local function response_accepted(result)
         return true
     end
     return false
+end
+
+local function response_summary(result)
+    if type(result) ~= "table" then
+        return "type=" .. type(result) .. ",value=" .. tostring(result)
+    end
+    local parts = {}
+    for _, key in ipairs({ "succ", "synckey", "errcode", "errCode" }) do
+        if result[key] ~= nil then
+            table.insert(parts, key .. "=" .. tostring(result[key]))
+        end
+    end
+    local message = result.errmsg or result.errMsg or result.message
+    if message ~= nil then
+        message = tostring(message):gsub("[%c]+", " "):sub(1, 160)
+        table.insert(parts, "message=" .. message)
+    end
+    return #parts > 0 and table.concat(parts, ",") or "table_without_status"
 end
 
 -- Persist one mutated book record (books are stored per-book via
@@ -129,6 +147,30 @@ function ProgressUploader:new(options)
     }, self)
 end
 
+-- Internal cumulative active time for the current document session.
+-- Payload rt is derived from the unreported portion of this value.
+-- Exclude both completed and currently-active suspend intervals.
+function ProgressUploader:_readingElapsed(at)
+    -- Freeze the clock once CloseDocument arrives. A retry may run 30 seconds
+    -- later, but that wait is no longer active reading time.
+    local current = tonumber(at or self.closed_at or self.now()) or 0
+    local opened = tonumber(self.opened_at) or current
+    local paused = tonumber(self.paused_seconds) or 0
+    if self.paused_at then
+        paused = paused + math.max(0,
+            current - (tonumber(self.paused_at) or current))
+    end
+    return math.floor(math.max(0, current - opened - paused))
+end
+
+-- Active seconds not yet covered by a successfully accepted report.
+-- This is intentionally separate from wall-clock time so suspend gaps
+-- stay excluded and failed/offline reports can be caught up later.
+function ProgressUploader:_unreportedElapsed(at)
+    return math.max(0, self:_readingElapsed(at)
+        - (tonumber(self.last_reported_rt) or 0))
+end
+
 -- book_id of the WeRead download matching an open file path, or nil.
 function ProgressUploader:detectBook(path)
     if type(path) ~= "string" or path == "" then
@@ -162,14 +204,27 @@ function ProgressUploader:onReaderReady(path)
     self.last_position = nil
     self.last_uploaded = nil
     self.last_upload_at = nil
+    -- Cumulative active seconds already covered by accepted delta
+    -- reports; despite the legacy name, this is not the last rt payload.
+    self.last_reported_rt = 0
+    self.closing = false
+    self.close_position = nil
+    self.closed_at = nil
+    self.paused_at = nil
+    self.paused_seconds = 0
     self._toc_aligned_source = nil
     self._toc_aligned = nil
     self.opened_at = self.now()
     local book_id = self:detectBook(path)
     if not book_id or WeRead.is_mp_book(book_id) then
+        logger.dbg("reader open ignored:", "path=", tostring(path),
+            "detected_book=", tostring(book_id))
         return nil
     end
     self.book_id = tostring(book_id)
+    logger.info("reading session opened:", "book=", self.book_id,
+        "generation=", tostring(self.generation),
+        "heartbeat_s=", tostring(self.heartbeat_interval))
     -- Pull-then-upload on open: fetch the cloud position first (jumping
     -- forward when it is ahead), then report the resulting position, so a
     -- stale local position never overwrites newer cloud progress.
@@ -187,8 +242,8 @@ function ProgressUploader:onReaderReady(path)
             self:_upload(position, "document_open")
         end
     end)
-    -- Reading-time heartbeats: the web endpoint drops rt > 60, so uploads
-    -- run on a sub-minute timer rather than being driven by page turns.
+    -- A 30-second cadence normally keeps each active-time delta below
+    -- the endpoint's 60-second acceptance limit.
     if self.heartbeat_interval then
         self.scheduler:scheduleIn(self.heartbeat_interval, function()
             self:_heartbeat(generation)
@@ -201,7 +256,11 @@ end
 -- record it; the timer is what reports position and reading time), then
 -- re-arm. Stops when the document changes.
 function ProgressUploader:_heartbeat(generation)
-    if generation ~= self.generation or not self.book_id then
+    if generation ~= self.generation or not self.book_id or self.closing then
+        logger.dbg("heartbeat stopped:", "scheduled_generation=", tostring(generation),
+            "current_generation=", tostring(self.generation),
+            "book=", tostring(self.book_id),
+            "closing=", tostring(self.closing == true))
         return
     end
     local fraction = self.get_fraction and self.get_fraction()
@@ -210,12 +269,45 @@ function ProgressUploader:_heartbeat(generation)
         self.last_position = position
         self.dirty = true
         self:_upload(position, "heartbeat")
+    else
+        logger.warn("heartbeat skipped: position unavailable:",
+            "book=", tostring(self.book_id),
+            "fraction=", tostring(fraction))
     end
     if self.heartbeat_interval then
         self.scheduler:scheduleIn(self.heartbeat_interval, function()
             self:_heartbeat(generation)
         end)
     end
+end
+
+-- Reader/device suspend and resume events delimit time that must not be
+-- counted as active reading. Calls are idempotent because KOReader may
+-- deliver more than one lifecycle notification around a sleep cycle.
+function ProgressUploader:onSuspend()
+    if not self.book_id or self.paused_at then
+        return
+    end
+    self.paused_at = self.now()
+    logger.info("reading session paused:", "book=", tostring(self.book_id),
+        "active_total_s=", tostring(self:_readingElapsed(self.paused_at)),
+        "reported_total_s=", tostring(self.last_reported_rt))
+end
+
+function ProgressUploader:onResume()
+    if not self.paused_at then
+        return
+    end
+    local resumed_at = self.now()
+    local paused_for = math.max(0,
+        resumed_at - (tonumber(self.paused_at) or resumed_at))
+    self.paused_seconds = (tonumber(self.paused_seconds) or 0) + paused_for
+    self.paused_at = nil
+    logger.info("reading session resumed:", "book=", tostring(self.book_id),
+        "paused_s=", tostring(paused_for),
+        "paused_total_s=", tostring(self.paused_seconds),
+        "active_total_s=", tostring(self:_readingElapsed(resumed_at)),
+        "reported_total_s=", tostring(self.last_reported_rt))
 end
 
 -- Fetch the cloud position of the open book and jump forward when it is
@@ -496,7 +588,7 @@ end
 -- heartbeat timer is what uploads — page turns never trigger network
 -- traffic themselves.
 function ProgressUploader:onPageUpdate(fraction)
-    if not self.book_id or not fraction then
+    if not self.book_id or self.closing or not fraction then
         return
     end
     local position = self:capture(fraction)
@@ -511,36 +603,70 @@ function ProgressUploader:onPageUpdate(fraction)
     self.dirty = true
 end
 
--- ReaderUI CloseDocument event: one final upload while the document is
--- still alive, then invalidate everything bound to this document.
---
--- The reset is deferred past the upload's scheduled task: _upload runs
--- its first attempt 0.1s later and aborts on a generation mismatch, so
--- bumping the generation here synchronously would silently drop every
--- close upload (unit tests never caught this: their scheduler runs
--- tasks immediately, before the bump).
-function ProgressUploader:onCloseDocument(fraction)
-    if self.book_id then
-        local position = (fraction and self:capture(fraction))
-            or self.last_position
-        if position and self.dirty then
-            self:_upload(position, "document_close")
-        end
+-- Clear state after the final close upload has either succeeded or exhausted
+-- its retry chain. The generation guard prevents an old session from clearing
+-- a newly opened document.
+function ProgressUploader:_finishClose(generation)
+    if generation ~= self.generation or not self.closing then
+        return
     end
+    local unreported = self:_unreportedElapsed()
+    logger.info("reading session closed:", "book=", tostring(self.book_id),
+        "reported_total_s=", tostring(self.last_reported_rt or 0),
+        "unreported_s=", tostring(unreported))
+    self.generation = self.generation + 1
+    self.book_id = nil
+    self.book = nil
+    self.chapters = nil
+    self.dirty = false
+    self.uploading = false
+    self.entered = false
+    self.last_position = nil
+    self.last_uploaded = nil
+    self.paused_at = nil
+    self.paused_seconds = 0
+    self.last_reported_rt = nil
+    self.closing = false
+    self.close_position = nil
+    self.closed_at = nil
+end
+
+-- ReaderUI CloseDocument event: freeze active time, stop heartbeats and keep
+-- the session alive until the final upload (including retries) completes.
+function ProgressUploader:onCloseDocument(fraction)
+    if not self.book_id or self.closing then
+        return
+    end
+    self.closed_at = self.now()
+    self.closing = true
+    local position = (fraction and self:capture(fraction))
+        or self.last_position
+    self.close_position = position
+    local elapsed = self:_readingElapsed()
+    local unreported = self:_unreportedElapsed()
+    logger.info("reading session closing:", "book=", tostring(self.book_id),
+        "dirty=", tostring(self.dirty),
+        "uploading=", tostring(self.uploading == true),
+        "active_total_s=", tostring(elapsed),
+        "reported_total_s=", tostring(self.last_reported_rt),
+        "unreported_s=", tostring(unreported),
+        "position=", tostring(position ~= nil))
     local generation = self.generation
-    self.scheduler:scheduleIn(0.2, function()
-        -- A new document opened in the meantime bumped the generation
-        -- and already reset this state itself.
-        if generation ~= self.generation then
-            return
-        end
-        self.generation = self.generation + 1
-        self.book_id = nil
-        self.book = nil
-        self.chapters = nil
-        self.last_position = nil
-        self.last_uploaded = nil
-    end)
+    if self.uploading then
+        logger.info("close upload queued behind active upload:",
+            "book=", tostring(self.book_id))
+        return
+    end
+    if not position or (not self.dirty and unreported <= 0) then
+        self:_finishClose(generation)
+        return
+    end
+    if not self:_upload(position, "document_close") then
+        logger.warn("reading session closed without final upload:",
+            "book=", tostring(self.book_id),
+            "unreported_s=", tostring(unreported))
+        self:_finishClose(generation)
+    end
 end
 
 -- Schedule one upload attempt chain for a captured position. The
@@ -548,51 +674,85 @@ end
 -- a parallel send; it is cleared on success, on final failure and when
 -- the document changes underneath a scheduled task.
 function ProgressUploader:_upload(position, reason, attempt)
-    if self.uploading or not position then
-        return
+    if not position then
+        logger.warn("upload skipped:", "reason=", tostring(reason),
+            "cause=position_missing")
+        return false
+    end
+    if self.uploading then
+        logger.info("upload skipped:", "book=", tostring(position.book_id),
+            "reason=", tostring(reason), "cause=upload_busy")
+        return false
     end
     if not self.is_online() then
         -- Offline: keep the position dirty; the next heartbeat or the
         -- document close will try again.
-        return
+        logger.info("upload deferred:", "book=", tostring(position.book_id),
+            "reason=", tostring(reason), "cause=offline")
+        return false
     end
     attempt = attempt or 1
     self.uploading = true
+    logger.info("upload scheduled:", "book=", tostring(position.book_id),
+        "reason=", tostring(reason), "attempt=", tostring(attempt),
+        "percent=", tostring(position.percent))
     local generation = self.generation
     self.scheduler:scheduleIn(0.1, function()
         if generation ~= self.generation then
-            self.uploading = false
             return
         end
-        -- Clamp to RT_CAP: the server silently discards the reading time
-        -- of any report whose rt exceeds 60 (returns succ regardless).
-        local elapsed = math.min(RT_CAP, math.max(0, self.now()
-            - (self.last_upload_at or self.opened_at or self.now())))
+        local active_total = self:_readingElapsed()
+        local unreported = self:_unreportedElapsed()
+        local elapsed = math.min(RT_CAP, unreported)
+        logger.info("upload sending:", "book=", tostring(position.book_id),
+            "reason=", tostring(reason), "attempt=", tostring(attempt),
+            "rt=", tostring(elapsed),
+            "active_total_s=", tostring(active_total),
+            "reported_total_s=", tostring(self.last_reported_rt or 0),
+            "backlog_after_s=", tostring(math.max(0, unreported - elapsed)),
+            "paused_s=", tostring(self.paused_seconds or 0),
+            "percent=", tostring(position.percent))
         local ok, err = pcall(function()
-            return self:_send(position, elapsed)
+            return self:_send(position, elapsed, reason, attempt)
         end)
         if generation ~= self.generation then
-            self.uploading = false
             return
         end
         if ok and not err then
             self.uploading = false
             self.dirty = false
             self.last_upload_at = self.now()
+            self.last_reported_rt =
+                (tonumber(self.last_reported_rt) or 0) + elapsed
             self.last_uploaded = position
             logger.info("progress uploaded: book=", tostring(position.book_id),
-                "percent=", tostring(position.percent), "reason=", reason)
+                "percent=", tostring(position.percent), "reason=", reason,
+                "attempt=", tostring(attempt), "rt=", tostring(elapsed),
+                "reported_total_s=", tostring(self.last_reported_rt))
             self:_persist(position)
             if self.on_uploaded then
                 pcall(self.on_uploaded, position.book_id, position)
             end
+            if self.closing then
+                local final_position = self.close_position or position
+                local position_pending = final_position
+                    and not PositionMapper.same_position(final_position, position)
+                local time_pending = self:_unreportedElapsed() > 0
+                if position_pending or time_pending then
+                    if self:_upload(final_position, "document_close") then
+                        return
+                    end
+                end
+                self:_finishClose(generation)
+            end
             return
         end
-        logger.warn("progress upload failed:", tostring(err))
+        logger.warn("progress upload failed:", "book=", tostring(position.book_id),
+            "reason=", tostring(reason), "attempt=", tostring(attempt),
+            "rt=", tostring(elapsed), "error=", tostring(err))
         if attempt <= RETRY_LIMIT then
             self.scheduler:scheduleIn(RETRY_DELAY, function()
                 if generation ~= self.generation then
-                    self.uploading = false
                     return
                 end
                 self.uploading = false
@@ -600,15 +760,19 @@ function ProgressUploader:_upload(position, reason, attempt)
             end)
         else
             self.uploading = false
+            if self.closing then
+                self:_finishClose(generation)
+            end
         end
     end)
+    return true
 end
 
 -- Blocking network part (runs inside a scheduled task): send the
 -- enter-read report once per document, then the read report. When the
 -- stored web-session tokens are rejected, refresh the reader state once
 -- and retry before giving up. Returns nil on success, error otherwise.
-function ProgressUploader:_send(position, elapsed)
+function ProgressUploader:_send(position, elapsed, reason, attempt)
     local book_id = position.book_id
     local book = self.settings:get("books", {})[tostring(book_id)]
     if type(book) ~= "table" then
@@ -624,7 +788,7 @@ function ProgressUploader:_send(position, elapsed)
     local referer = book.reader_url or WeRead.reader_url(book_id)
 
     if not self.entered then
-        self.client:report_read(WeRead.make_enter_read_payload{
+        local enter_result = self.client:report_read(WeRead.make_enter_read_payload{
             book_id = book_id,
             chapter_uid = position.chapter_uid or book.chapter_uid,
             chapter_idx = tonumber(position.chapter_idx) or 0,
@@ -635,6 +799,8 @@ function ProgressUploader:_send(position, elapsed)
             psvts = book.psvts,
             pclts = book.pclts,
         }, referer)
+        logger.info("enter-read response:", "book=", tostring(book_id),
+            "result=", response_summary(enter_result))
         self.entered = true
     end
 
@@ -655,7 +821,12 @@ function ProgressUploader:_send(position, elapsed)
     end
 
     local result = send_read()
-    if response_accepted(result) then
+    local accepted = response_accepted(result)
+    logger.info("read response:", "book=", tostring(book_id),
+        "reason=", tostring(reason), "attempt=", tostring(attempt),
+        "rt=", tostring(elapsed), "accepted=", tostring(accepted),
+        "result=", response_summary(result))
+    if accepted then
         return nil
     end
     -- The stored psvts/pclts belong to the download-time web session and
@@ -663,7 +834,13 @@ function ProgressUploader:_send(position, elapsed)
     Content.ensure_reader_state(self.client, book)
     persist_book(self.settings, book)
     result = send_read()
-    if response_accepted(result) then
+    accepted = response_accepted(result)
+    logger.info("read response after state refresh:",
+        "book=", tostring(book_id), "reason=", tostring(reason),
+        "attempt=", tostring(attempt), "rt=", tostring(elapsed),
+        "accepted=", tostring(accepted),
+        "result=", response_summary(result))
+    if accepted then
         return nil
     end
     return "server_rejected"

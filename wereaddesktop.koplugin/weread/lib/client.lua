@@ -513,6 +513,55 @@ function Client:get_progress(book_id)
     return self:gateway("/book/getprogress", { bookId = book_id })
 end
 
+-- Keep WeRead's explicit "finished" flag in sync with KOReader's book
+-- status. This is separate from /web/book/read progress=100. The agent
+-- gateway does not expose this route, so use the same authenticated web
+-- session as the official reader's /web/book/markStatus request.
+function Client:mark_book_finished(book_id, finished)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    finished = finished == true
+    local function send()
+        return self:post_json(
+            "https://weread.qq.com/web/book/markStatus",
+            {
+                bookId = tostring(book_id),
+                status = 4,
+                isCancel = finished and 0 or 1,
+                finishInfo = finished and 1 or 0,
+            },
+            {
+                referer = WeRead.reader_url(book_id),
+                diagnostic_api = "mark_book_finished",
+            }
+        )
+    end
+    local ok, result = pcall(send)
+    if ok and type(result) == "table"
+        and tonumber(result.errCode or result.errcode) == -2012 then
+        logger.info("mark finished: session expired, renewing cookie")
+        local renew_ok = pcall(self.renew_cookie, self)
+        if renew_ok then
+            ok, result = pcall(send)
+        end
+    end
+    if not ok then
+        return false, nil, tostring(result)
+    end
+    if type(result) ~= "table" then
+        return false, nil, "markStatus: web endpoint returned non-table"
+    end
+    local err_code = result.errCode or result.errcode
+    local failed_succ = result.succ ~= nil
+        and result.succ ~= true
+        and tonumber(result.succ) ~= 1
+    if (err_code ~= nil and tonumber(err_code) ~= 0) or failed_succ then
+        return false, result, "markStatus: API rejected request"
+    end
+    return true, result
+end
+
 function Client:get_web_progress(book_id)
     local url = "https://weread.qq.com/web/book/getProgress?bookId="
         .. WeRead.urlencode(book_id)
@@ -619,6 +668,7 @@ end
 function Client:report_read(payload, referer)
     return self:post_json("https://weread.qq.com/web/book/read", payload, {
         referer = referer or "https://weread.qq.com/",
+        diagnostic_api = "report_read",
     })
 end
 
@@ -713,6 +763,31 @@ function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
     end
 
     return true, { reviews = all_reviews }
+end
+
+-- Whole-book featured reviews. The verified official web route is
+-- /web/review/list/best; the agent gateway performs its web-side signing so
+-- the Kindle never needs a browser cookie or the short-lived x-wrpa header.
+function Client:get_book_reviews(book_id, opts)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    opts = opts or {}
+    local ok, result = pcall(function()
+        return self:gateway("/review/list/best", {
+            bookId = tostring(book_id),
+            maxIdx = tonumber(opts.max_idx) or 0,
+            count = tonumber(opts.count) or 20,
+            synckey = tonumber(opts.sync_key) or 0,
+        })
+    end)
+    if not ok then
+        return false, nil, tostring(result)
+    end
+    if type(result) ~= "table" or type(result.reviews) ~= "table" then
+        return false, nil, "book reviews: gateway returned invalid data"
+    end
+    return true, result
 end
 
 return Client

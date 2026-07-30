@@ -319,12 +319,10 @@ function Downloader:_applyAnnotations(dl)
     local started = time.now()
     local ok, processed, annotation_css = pcall(function()
         return Thoughts.apply_data(self.settings, book_id, chapter.chapterUid,
-            dl.current.xhtml, annotation.underlines, annotation.reviews, dl.book, {
-            rebuild_thought_db = not dl.single_chapter and dl.index == 1,
-        })
+            dl.current.xhtml, annotation.underlines, nil, dl.book)
     end)
     self:_perf(dl, "apply_annotations", started, "ok=", tostring(ok),
-        "reviews=", tostring(#annotation.reviews))
+        "thought_locations=", tostring(annotation.thought_locations or 0))
     if not ok then
         self:_failChapter(dl, processed)
         return
@@ -336,65 +334,6 @@ function Downloader:_applyAnnotations(dl)
         dl.state.annotation_css_seen[annotation_css] = true
     end
     self:_finishChapter(dl)
-end
-
-function Downloader:_annotationBatch(dl)
-    if dl.cancelled then
-        self:_releaseStandby(dl)
-        self.show_transient(_("Download cancelled"), 2)
-        return
-    end
-    local annotation = dl.annotation
-    if not annotation then
-        self:_finishChapter(dl)
-        return
-    end
-    if annotation.batch_index > #annotation.batches then
-        self:_applyAnnotations(dl)
-        return
-    end
-
-    local batch_index = annotation.batch_index
-    local batch_total = #annotation.batches
-    local fractional = dl.index - 0.85 + 0.7 * batch_index / math.max(1, batch_total)
-    self:_setStage(dl,
-        T(_("Downloading thoughts %1/%2 · chapter %3/%4"),
-            tostring(batch_index), tostring(batch_total), tostring(dl.index), tostring(dl.total)),
-        fractional)
-
-    local started = time.now()
-    local ok, result, err = self.client:get_chapter_reviews_batch(
-        dl.book.book_id or dl.book.bookId,
-        dl.current.chapter.chapterUid,
-        annotation.batches[batch_index]
-    )
-    self:_perf(dl, "thought_batch", started,
-        "batch=", tostring(batch_index) .. "/" .. tostring(batch_total),
-        "ok=", tostring(ok), "retry=", tostring(annotation.retry))
-
-    if not ok then
-        if annotation.retry < 2 then
-            annotation.retry = annotation.retry + 1
-            self:_setStage(dl,
-                T(_("Retrying thoughts %1/%2 · attempt %3"),
-                    tostring(batch_index), tostring(batch_total), tostring(annotation.retry)),
-                fractional)
-            self:_scheduleGuarded(dl, function() self:_annotationBatch(dl) end, 0.6 * annotation.retry)
-            return
-        end
-        dl.annotation_failed_batches = dl.annotation_failed_batches + 1
-        logger.warn("thought batch skipped:",
-            "batch=", tostring(batch_index) .. "/" .. tostring(batch_total),
-            "error=", log_error(err or "unknown"))
-    elseif result and type(result.reviews) == "table" then
-        for _i, review in ipairs(result.reviews) do
-            annotation.reviews[#annotation.reviews + 1] = review
-        end
-    end
-
-    annotation.batch_index = batch_index + 1
-    annotation.retry = 0
-    self:_scheduleGuarded(dl, function() self:_annotationBatch(dl) end, 0.3)
 end
 
 function Downloader:_startAnnotations(dl)
@@ -416,16 +355,17 @@ function Downloader:_startAnnotations(dl)
     end
     dl.annotation = {
         underlines = underlines,
-        reviews = {},
-        batches = self.client:build_chapter_review_batches(ranges),
-        batch_index = 1,
-        retry = 0,
+        thought_locations = 0,
     }
-    if #dl.annotation.batches == 0 then
-        self:_applyAnnotations(dl)
-    else
-        self:_scheduleGuarded(dl, function() self:_annotationBatch(dl) end, 0.1)
+    for _, underline in ipairs(underlines.underlines or {}) do
+        if tonumber(underline.type) == 0 then
+            dl.annotation.thought_locations =
+                dl.annotation.thought_locations + 1
+        end
     end
+    -- Comment bodies are intentionally not downloaded here. Every underline
+    -- stores a lazy range link; type=0 locations additionally show a star.
+    self:_applyAnnotations(dl)
 end
 
 -- Fill-missing repack: walk the FULL catalog, taking each chapter's

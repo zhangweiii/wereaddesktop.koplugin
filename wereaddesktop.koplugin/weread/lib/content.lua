@@ -378,6 +378,83 @@ local function xml_escape(value)
     return value
 end
 
+-- WeRead publisher footnotes arrive as a solid-color note.png whose
+-- annotation text exists only in the image's alt attribute:
+--   <img class="qqreader-footnote" alt="annotation" .../>
+-- Convert them into standard EPUB noteref/footnote pairs so KOReader can
+-- render a font-safe marker and show the annotation in its native popup.
+function Content.convert_publisher_footnotes(xhtml)
+    if type(xhtml) ~= "string" or xhtml == "" then
+        return xhtml, 0
+    end
+
+    local footnotes = {}
+    local function attribute(tag, name)
+        return tag:match('[%s<]' .. name .. '%s*=%s*"(.-)"')
+            or tag:match("[%s<]" .. name .. "%s*=%s*'(.-)'")
+    end
+    local converted = xhtml:gsub("<img%s[^>]->", function(tag)
+        local class_name = attribute(tag, "class")
+        local padded_class = " "
+            .. tostring(class_name or ""):gsub("%s+", " ") .. " "
+        if not padded_class:find(" qqreader-footnote ", 1, true) then
+            return tag
+        end
+
+        local index = #footnotes + 1
+        local note = attribute(tag, "alt")
+        if type(note) ~= "string" or note == "" then
+            note = "注释"
+        end
+        footnotes[index] = note
+        return '<a id="wr-footnote-ref-' .. index
+            .. '" class="wr-footnote-ref" epub:type="noteref"'
+            .. ' role="doc-noteref" href="#wr-footnote-' .. index
+            .. '"><sup>[' .. index .. ']</sup></a>'
+    end)
+
+    if #footnotes == 0 then
+        return xhtml, 0
+    end
+
+    local targets = {
+        '\n<section class="wr-footnotes" epub:type="footnotes"'
+            .. ' role="doc-endnotes">\n',
+    }
+    for index, note in ipairs(footnotes) do
+        targets[#targets + 1] = '<aside id="wr-footnote-' .. index
+            .. '" class="wr-footnote" epub:type="footnote"'
+            .. ' role="doc-footnote"><p><a href="#wr-footnote-ref-'
+            .. index .. '">' .. index .. '.</a> ' .. note
+            .. '</p></aside>\n'
+    end
+    targets[#targets + 1] = "</section>\n"
+    local target_html = table.concat(targets)
+
+    -- Decoded chapters may contain multiple concatenated XHTML documents.
+    -- Place all targets in the last body so every target follows its source,
+    -- which is required by KOReader's conservative footnote detection.
+    local body_close
+    local search_from = 1
+    while true do
+        local found = converted:find("</body>", search_from, true)
+        if not found then
+            break
+        end
+        body_close = found
+        search_from = found + 7
+    end
+    if body_close then
+        converted = converted:sub(1, body_close - 1) .. target_html
+            .. converted:sub(body_close)
+    else
+        converted = converted .. target_html
+    end
+
+    logger.info("publisher footnotes converted:", tostring(#footnotes))
+    return converted, #footnotes
+end
+
 -- WeRead EPUB chapters may decode to multiple concatenated XHTML documents.
 -- The first <body> is often a title shell; main content lives in later bodies.
 local function body_fragment(xhtml)
@@ -1090,6 +1167,7 @@ end
 function Content.finalize_single_chapter_content(client, settings, book, chapter, xhtml, state)
     state = state or {}
     local chapter_assets = {}
+    xhtml = Content.convert_publisher_footnotes(xhtml)
     local cache = settings:get("cache", {})
     if cache.download_book_images then
         state.used_asset_names = state.used_asset_names or {}

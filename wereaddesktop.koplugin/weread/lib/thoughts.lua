@@ -18,7 +18,10 @@ end
 
 function Thoughts.is_download_enabled(settings)
     local cache = settings:get("cache", {})
-    return cache.download_underlines_and_thoughts == true
+    -- Only lightweight underline/thought locations are downloaded now;
+    -- comment bodies are fetched on tap. Keep annotations enabled by default
+    -- and let the existing show_annotations flag disable the extra request.
+    return cache.show_annotations ~= false
 end
 
 function Thoughts.fetch_underlines(client, settings, book_id, chapter_uid)

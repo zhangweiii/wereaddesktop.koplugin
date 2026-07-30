@@ -233,6 +233,31 @@ end
 
 Annotations.thoughtAnchorId = thoughtAnchorId
 
+--- Generate the internal URI handled by the reader-context plugin.
+-- Keeping the complete cache key in the URI avoids mapping a CRe xpointer
+-- back to WeRead's original chapter character range after the EPUB is built.
+function Annotations.thoughtURL(book_id, chapter_uid, range_str)
+    return "wrthought://" .. idSafe(book_id) .. "/" .. idSafe(chapter_uid)
+        .. "/" .. tostring(range_str or "")
+end
+
+function Annotations.parseThoughtURL(url)
+    if type(url) ~= "string" then
+        return nil
+    end
+    local book_id, chapter_uid, range_str = url:match(
+        "^wrthought://([%w%._%-]+)/([%w%._%-]+)/(%d+%-%d+)$"
+    )
+    if not book_id then
+        return nil
+    end
+    return {
+        book_id = book_id,
+        chapter_uid = tonumber(chapter_uid) or chapter_uid,
+        range = range_str,
+    }
+end
+
 --- Convert one range review into the small, plain-text records used by the
 -- native thought dialog. Keeping these fields separate in SQLite means a tap
 -- never has to decode the chapter JSON or start an HTML renderer.
@@ -345,25 +370,32 @@ function Annotations.injectUnderlines(html, underlines, thought_reviews, chapter
         -- 使用 wrapTextSegments 处理跨标签边界
         local wrapped = wrapTextSegments(inner, "wr-underline")
 
-        -- 如果有想法数据，每个 wr-underline span 单独包裹 <a>（跨段可点击）
-        if thought_reviews and thought_reviews[ul.range_str] then
+        -- Every visible underline must be tappable. Otherwise a popular
+        -- underline (type=2) looks identical to a thought location but its
+        -- tap falls through to KOReader's page-turn zone. Known thought
+        -- locations keep the star; other ranges lazily fetch and can show
+        -- an explicit empty result.
+        if book_id ~= nil and chapter_uid ~= nil then
+            local has_known_thought = thought_reviews
+                and thought_reviews[ul.range_str]
             local underline_open = '<span class="wr-underline">'
             local underline_close = '</span>'
             local underline_close_with_ref = '<span class="wr-star">*</span></span>'
 
-            -- 星号注入到最后一个 underline span 末尾
+            -- 星号只注入已知有公开想法的位置。
             local last_idx = #wrapped
-            if wrapped[last_idx] == underline_close then
+            if has_known_thought and wrapped[last_idx] == underline_close then
                 wrapped[last_idx] = underline_close_with_ref
             end
 
-            -- 内部锚点（非 noteref）：去掉 epub:type="noteref" 避免 crengine 走专用
-            -- 脚注弹窗路径（该路径无视 CSS pointer-events）。想法内容不再内嵌 EPUB，
-            -- 点击时由 main.lua 从缓存 JSON 现取。锚点已编码 book_id+chapter_uid+range。
+            -- Custom URI: ReaderLink hands external URIs to main.lua, which can
+            -- look up this single range in SQLite and fetch it lazily when absent.
             local anchor_id = thoughtAnchorId(book_id, chapter_uid, ul.range_str)
-            local href = "#" .. anchor_id
+            local href = Annotations.thoughtURL(
+                book_id, chapter_uid, ul.range_str
+            )
             local open_a = '<a class="wr-thought-link" href="' .. htmlEscape(href) .. '">'
-            -- 只第一个 <a> 带 id：拦截失败时 KOReader 跟随锚点最多跳回划线起点（兜底）。
+            -- 只第一个 <a> 带 id，保证跨块划线不会产生重复 XHTML id。
             local open_a_with_id = '<a id="' .. htmlEscape(anchor_id)
                 .. '" class="wr-thought-link" href="' .. htmlEscape(href) .. '">'
 
@@ -443,18 +475,27 @@ function Annotations.process(html, chapter_underlines, thought_reviews, book_id)
         return html, ""
     end
 
-    -- 构建 thought range 快速查找表
-    local thought_map = nil
+    -- type=0 is a known public-thought location; type=2 is a popular
+    -- underline. All ranges become tappable, while this map controls the
+    -- star shown only where public thoughts are known to exist.
+    local thought_map = {}
+    for _, underline in ipairs(underlines) do
+        if tonumber(underline.type) == 0
+            and type(underline.range) == "string" then
+            thought_map[underline.range] = true
+        end
+    end
+    -- Older cached underline payloads may not include type. Preserve links
+    -- for ranges whose comment bodies were already cached.
     if type(thought_reviews) == "table" then
-        thought_map = {}
         for _, rv in ipairs(thought_reviews) do
             if rv.range and rv.pageReviews and #rv.pageReviews > 0 then
                 thought_map[rv.range] = true
             end
         end
-        if not next(thought_map) then
-            thought_map = nil
-        end
+    end
+    if not next(thought_map) then
+        thought_map = nil
     end
 
     logger.info("annotations: processing", #underlines, "underlines",
@@ -463,13 +504,12 @@ function Annotations.process(html, chapter_underlines, thought_reviews, book_id)
     local processed = Annotations.injectUnderlines(html, underlines, thought_map,
         chapter_underlines.chapterUid, book_id)
 
-    -- 想法内容不再注入 EPUB（不生成 <aside> 脚注），改为点击时从缓存 JSON 现取。
+    -- 想法内容不再注入 EPUB（不生成 <aside> 脚注），点击时从 SQLite
+    -- 缓存读取；未命中时只请求当前 range。
 
     if processed ~= html then
         local css = Annotations.UNDERLINE_CSS
-        if thought_map then
-            css = css .. "\n" .. Annotations.THOUGHT_CSS
-        end
+            .. "\n" .. Annotations.THOUGHT_CSS
         return processed, css
     end
 

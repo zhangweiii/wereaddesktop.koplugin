@@ -151,6 +151,7 @@ function Bridge:logout()
     end
     self.settings:reset_account()
     self.settings:set(SHELF_CACHE_KEY, nil)
+    self.settings:set("pending_finish_sync", nil)
     self.settings:flush()
 end
 
@@ -191,6 +192,23 @@ function Bridge:updateShelfProgress(book_id, fraction)
     for _, book in ipairs(books) do
         if book.book_id == tostring(book_id) then
             book.progress = math.max(0, math.min(1, tonumber(fraction) or 0))
+            self:saveShelf(books)
+            return
+        end
+    end
+end
+
+-- Patch the cached shelf after the explicit finished flag has been
+-- accepted by WeRead. Progress and completion are separate server fields,
+-- so cancelling completion must not rewind the last reading position.
+function Bridge:updateShelfFinished(book_id, finished)
+    local books = self:getCachedShelf()
+    if not books then
+        return
+    end
+    for _, book in ipairs(books) do
+        if book.book_id == tostring(book_id) then
+            book.finished = finished == true
             self:saveShelf(books)
             return
         end

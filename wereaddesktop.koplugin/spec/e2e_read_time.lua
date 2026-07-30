@@ -143,9 +143,12 @@ print("======== SESSION END " .. os.date("%H:%M:%S") .. " ========")
 
 local rt_sum = 0
 for _, r in ipairs(reports) do
-    if r.accepted and r.rt then rt_sum = rt_sum + r.rt end
+    if r.accepted and tonumber(r.rt) then
+        rt_sum = rt_sum + tonumber(r.rt)
+    end
 end
-print("accepted report_read count:", #reports, " sum of accepted rt:", rt_sum, "s")
+print("accepted report_read count:", #reports,
+    " sum of accepted rt:", rt_sum, "s")
 
 -- ---- Restore the original position ------------------------------------
 local book_now = settings:get("books", {})[BOOK_ID]

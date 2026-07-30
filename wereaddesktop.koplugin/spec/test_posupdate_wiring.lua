@@ -66,6 +66,28 @@ end
 package.preload["ui/network/manager"] = function()
     return { isConnected = function() return true end }
 end
+package.preload["apps/reader/modules/readerlink"] = function()
+    return {
+        showLinkBox = function(self, _link, allow_footnote_popup)
+            self.last_allow_footnote_popup = allow_footnote_popup
+            return true
+        end,
+        onGotoLink = function(self, link)
+            self.last_original_link = link and link.xpointer
+            return true
+        end,
+    }
+end
+package.preload["apps/reader/modules/readerstatus"] = function()
+    return {
+        markBook = function(self)
+            local summary = self.ui.doc_settings.summary
+            summary.status = summary.status == "complete"
+                and "reading" or "complete"
+            return summary.status
+        end,
+    }
+end
 
 -- Global reader settings: everything unset (progress sync defaults on).
 G_reader_settings = {
@@ -129,6 +151,11 @@ end
 -- page/page-count fraction), 80 of 100 pages read.
 local instance = WeReadDesktop:new{}
 instance.ui = {
+    doc_settings = {
+        summary = {
+            status = "reading",
+        },
+    },
     document = {
         file = "/cache/12345/book.epub",
         getCurrentPage = function() return 80 end,
@@ -139,19 +166,62 @@ instance.ui = {
 -- stub is not logged in, so no real uploader replaces our fake.
 instance:init()
 
-local calls = { ready = 0, page_update = 0, close = 0, last_fraction = nil }
+local calls = {
+    ready = 0,
+    page_update = 0,
+    close = 0,
+    suspend = 0,
+    resume = 0,
+    thought_link = nil,
+    last_fraction = nil,
+    finished = {},
+}
 instance.progress_uploader = {
-    onReaderReady = function(_, _path) calls.ready = calls.ready + 1 end,
+    onReaderReady = function(_, _path)
+        calls.ready = calls.ready + 1
+        return "12345"
+    end,
     onPageUpdate = function(_, fraction)
         calls.page_update = calls.page_update + 1
         calls.last_fraction = fraction
     end,
     onCloseDocument = function(_, _fraction) calls.close = calls.close + 1 end,
+    onSuspend = function() calls.suspend = calls.suspend + 1 end,
+    onResume = function() calls.resume = calls.resume + 1 end,
 }
+instance.openThoughtLink = function(_, url)
+    calls.thought_link = url
+    return true
+end
+instance.onLocalFinishedStatus = function(_, finished)
+    calls.finished[#calls.finished + 1] = finished
+end
 
 -- Sanity: the reader-context wiring itself works.
 dispatch(instance, "ReaderReady")
 check("ReaderReady reaches the uploader", calls.ready == 1)
+local ReaderStatus = require("apps/reader/modules/readerstatus")
+local reader_status = { ui = instance.ui }
+ReaderStatus.markBook(reader_status)
+check("marking a WeRead book complete reaches cloud-status sync",
+    calls.finished[1] == true)
+ReaderStatus.markBook(reader_status)
+check("marking it reading again reaches cloud-status cancellation",
+    calls.finished[2] == false)
+local ReaderLink = require("apps/reader/modules/readerlink")
+local reader_link = { ui = instance.ui }
+ReaderLink.showLinkBox(reader_link, { xpointer = "/footnote" }, false)
+check("WeRead documents force native footnote popup detection",
+    reader_link.last_allow_footnote_popup == true)
+ReaderLink.onGotoLink(reader_link, {
+    xpointer = "wrthought://12345/59/369-376",
+})
+check("WeRead thought links are intercepted instead of followed",
+    calls.thought_link == "wrthought://12345/59/369-376"
+    and reader_link.last_original_link == nil)
+ReaderLink.onGotoLink(reader_link, { xpointer = "https://example.com/" })
+check("unrelated links keep KOReader's original behavior",
+    reader_link.last_original_link == "https://example.com/")
 
 dispatch(instance, "PageUpdate")
 check("PageUpdate reaches the uploader", calls.page_update == 1)
@@ -162,6 +232,11 @@ check("fraction comes from the open document", calls.last_fraction == 0.8)
 dispatch(instance, "PosUpdate")
 check("PosUpdate reaches the uploader (EPUB page turns sync progress)",
     calls.page_update == 2)
+
+dispatch(instance, "Suspend")
+dispatch(instance, "Resume")
+check("Suspend/Resume reach the uploader (sleep time is excluded)",
+    calls.suspend == 1 and calls.resume == 1)
 
 dispatch(instance, "CloseDocument")
 check("CloseDocument reaches the uploader", calls.close == 1)

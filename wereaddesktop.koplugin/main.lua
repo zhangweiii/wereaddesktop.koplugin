@@ -11,6 +11,7 @@ local ProgressUploader = require("progressuploader")
 local UIManager = require("ui/uimanager")
 local WereadBridge = require("wereadbridge")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Annotations = require("weread.lib.annotations")
 local logger = require("logger")
 local _ = require("gettext")
 
@@ -39,6 +40,31 @@ local function migrateSettings()
     G_reader_settings:flush()
 end
 
+-- Read the radio and connection state through NetworkMgr's own refresh
+-- path. Keeping both values matters: Wi-Fi can be enabled without being
+-- associated with a network, which the stock KOReader menu treats as a
+-- third state (connect or turn off), not as a plain on/off toggle.
+local function networkState()
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if not ok or not NetworkMgr then
+        return false, false, nil
+    end
+    if type(NetworkMgr.queryNetworkState) == "function" then
+        pcall(NetworkMgr.queryNetworkState, NetworkMgr)
+    end
+    local function read(primary, fallback)
+        local method = NetworkMgr[primary] or NetworkMgr[fallback]
+        if type(method) ~= "function" then
+            return false
+        end
+        local ok_value, value = pcall(method, NetworkMgr)
+        return ok_value and value == true
+    end
+    local wifi_on = read("getWifiState", "isWifiOn")
+    local connected = wifi_on and read("getConnectionState", "isConnected")
+    return wifi_on, connected, NetworkMgr
+end
+
 function WeReadDesktop:init()
     -- The vendored WeRead protocol layer salts its signatures with
     -- math.random (protocol.lua ts/rn fields).
@@ -48,7 +74,12 @@ function WeReadDesktop:init()
     -- desktop itself (and its menu/callbacks) stays file-manager-only.
     if self.ui.document then
         self:hookShowFileManager()
+        self:hookWeReadFootnotePopups()
+        self:hookWeReadFinishedStatus()
         self:initProgressSync()
+        if self.ui.menu then
+            self.ui.menu:registerToMainMenu(self)
+        end
         return
     end
     -- WeRead shelf integration; the bridge doubles as the QRLogin host,
@@ -115,6 +146,92 @@ function WeReadDesktop:hookShowFileManager()
     end
 end
 
+local function readBookStatus(reader_status)
+    local doc_settings = reader_status.ui and reader_status.ui.doc_settings
+    if not doc_settings then
+        return nil
+    end
+    local summary
+    if type(doc_settings.readSetting) == "function" then
+        local ok, value = pcall(doc_settings.readSetting, doc_settings, "summary")
+        if ok then
+            summary = value
+        end
+    elseif type(doc_settings.summary) == "table" then
+        summary = doc_settings.summary
+    end
+    return type(summary) == "table" and summary.status or nil
+end
+
+-- KOReader's end-of-book dialog only changes summary.status locally and
+-- emits no event. Wrap that single mutation point once, preserving the
+-- original behavior, and notify the open WeRead document after it changed.
+function WeReadDesktop:hookWeReadFinishedStatus()
+    local ok, ReaderStatus = pcall(
+        require, "apps/reader/modules/readerstatus"
+    )
+    if not ok or ReaderStatus._wereaddesktop_finish_hooked
+        or type(ReaderStatus.markBook) ~= "function" then
+        return
+    end
+    ReaderStatus._wereaddesktop_finish_hooked = true
+    local original = ReaderStatus.markBook
+    ReaderStatus.markBook = function(reader_status, ...)
+        local previous = readBookStatus(reader_status)
+        local result = original(reader_status, ...)
+        local current = readBookStatus(reader_status)
+        local document = reader_status.ui and reader_status.ui.document
+        local handler = document
+            and document._wereaddesktop_finish_handler
+        if current ~= previous
+            and (current == "complete" or current == "reading")
+            and type(handler) == "function" then
+            local call_ok, err = pcall(handler, current == "complete")
+            if not call_ok then
+                logger.warn("wereaddesktop: finished-status handler failed:",
+                    tostring(err))
+            end
+        end
+        return result
+    end
+end
+
+-- KOReader only attempts its native footnote popup when the global
+-- "show footnotes in popup" preference is enabled. For a WeRead EPUB we
+-- know publisher note markers are real footnotes, so enable detection for
+-- that document without changing the user's global KOReader preference.
+function WeReadDesktop:hookWeReadFootnotePopups()
+    local ok, ReaderLink = pcall(require, "apps/reader/modules/readerlink")
+    if not ok or ReaderLink._wereaddesktop_footnote_hooked
+        or type(ReaderLink.showLinkBox) ~= "function" then
+        return
+    end
+    ReaderLink._wereaddesktop_footnote_hooked = true
+    local original = ReaderLink.showLinkBox
+    ReaderLink.showLinkBox = function(reader_link, link, allow_footnote_popup)
+        local document = reader_link.ui and reader_link.ui.document
+        if document and document._wereaddesktop_footnotes then
+            allow_footnote_popup = true
+        end
+        return original(reader_link, link, allow_footnote_popup)
+    end
+    if type(ReaderLink.onGotoLink) == "function" then
+        local original_goto = ReaderLink.onGotoLink
+        ReaderLink.onGotoLink = function(reader_link, link, ...)
+            local url = type(link) == "table" and link.xpointer or link
+            local document = reader_link.ui and reader_link.ui.document
+            local handler = document
+                and document._wereaddesktop_thought_handler
+            if type(url) == "string"
+                and url:find("wrthought://", 1, true) == 1
+                and type(handler) == "function" then
+                return handler(url)
+            end
+            return original_goto(reader_link, link, ...)
+        end
+    end
+end
+
 -- Called in the reader context (registered modules receive ReaderUI's
 -- CloseDocument event): one final progress upload while the document is
 -- still alive, plus a desktop re-show for the (uncommon) case that the
@@ -151,16 +268,28 @@ end
 -- on UIManager-deferred tasks and fail silently.
 ----------------------------------------------------------------
 
+local PENDING_FINISH_SYNC_KEY = "pending_finish_sync"
+
 -- Reader-context setup: build a dedicated bridge (settings + client,
 -- no UI) and the two-way progress sync.
+function WeReadDesktop:getReaderBridge()
+    if not self.reader_bridge then
+        self.reader_bridge = WereadBridge:new(self)
+    end
+    return self.reader_bridge
+end
+
 function WeReadDesktop:initProgressSync()
     if G_reader_settings:readSetting("wereaddesktop_progress_sync") == false then
+        logger.info("wereaddesktop: progress sync disabled by setting")
         return
     end
-    local bridge = WereadBridge:new(self)
+    local bridge = self:getReaderBridge()
     if not bridge:isLoggedIn() then
+        logger.warn("wereaddesktop: progress sync not started: WeRead login missing")
         return
     end
+    logger.info("wereaddesktop: progress sync initialized")
     self.progress_uploader = ProgressUploader:new{
         settings = bridge.settings,
         client = bridge.client,
@@ -338,24 +467,640 @@ end
 -- Non-blocking link-state check (unlike isNetworkOnline, which may do a
 -- blocking DNS lookup); used by the reader-context progress sync.
 function WeReadDesktop:isNetworkConnected()
-    local ok, NetworkMgr = pcall(require, "ui/network/manager")
-    if not ok or not NetworkMgr or not NetworkMgr.isConnected then
+    local _wifi_on, connected, NetworkMgr = networkState()
+    if not NetworkMgr then
         return self:isNetworkOnline()
     end
-    local ok_connected, connected = pcall(function()
-        return NetworkMgr:isConnected()
-    end)
-    if not ok_connected then
-        return true
-    end
-    return connected == true
+    return connected
 end
 
 function WeReadDesktop:onReaderReady()
+    local path = self.ui.document and self.ui.document.file
+    local book_id
     if self.progress_uploader then
-        self.progress_uploader:onReaderReady(
-            self.ui.document and self.ui.document.file)
+        book_id = self.progress_uploader:onReaderReady(path)
     end
+    if self.ui.document then
+        local path_book_id = type(path) == "string"
+            and path:match("/weread/cache/([^/]+)/") or nil
+        book_id = book_id or path_book_id
+        local is_weread = book_id ~= nil
+            or (type(path) == "string"
+                and path:find("/weread/cache/", 1, true) ~= nil)
+        self.current_weread_book_id = book_id
+        self.ui.document._wereaddesktop_footnotes = is_weread
+        self.ui.document._wereaddesktop_thought_handler =
+            is_weread and function(url)
+                return self:openThoughtLink(url)
+            end or nil
+        self.ui.document._wereaddesktop_finish_handler =
+            is_weread and book_id and function(finished)
+                return self:onLocalFinishedStatus(finished)
+            end or nil
+        if is_weread and book_id then
+            self:syncPendingFinishedStatus(book_id)
+        end
+    end
+end
+
+function WeReadDesktop:finishStatusBridge()
+    return self.reader_bridge or self.weread or self:getReaderBridge()
+end
+
+function WeReadDesktop:savePendingFinishedStatus(settings, pending)
+    settings:set(PENDING_FINISH_SYNC_KEY, pending)
+    settings:flush()
+end
+
+-- Persist before attempting the network request so a suspend, close or
+-- transient failure cannot lose the user's latest choice.
+function WeReadDesktop:onLocalFinishedStatus(finished)
+    local book_id = self.current_weread_book_id
+    if not book_id then
+        return false
+    end
+    book_id = tostring(book_id)
+    finished = finished == true
+    local bridge = self:finishStatusBridge()
+    local settings = bridge and bridge.settings
+    if not settings then
+        logger.warn("wereaddesktop: cannot queue finished status:",
+            "book_id=", book_id, "settings=missing")
+        return false
+    end
+    if type(settings.refresh) == "function" then
+        settings:refresh(PENDING_FINISH_SYNC_KEY)
+    end
+    local pending = settings:get(PENDING_FINISH_SYNC_KEY, {})
+    if type(pending) ~= "table" then
+        pending = {}
+    end
+    local account = settings:get("account", {})
+    pending[book_id] = {
+        finished = finished,
+        updated_at = os.time(),
+        user_vid = type(account) == "table"
+            and tostring(account.user_vid or "") or "",
+    }
+    self:savePendingFinishedStatus(settings, pending)
+    logger.info("wereaddesktop: queued finished status:",
+        "book_id=", book_id, "finished=", tostring(finished))
+
+    if not bridge.isLoggedIn or not bridge:isLoggedIn() then
+        logger.warn("wereaddesktop: finished status waiting for login:",
+            "book_id=", book_id)
+        self:showTransientInfo(
+            _("已在本地标记；登录微信读书后将自动同步。"), 3)
+        return true
+    end
+    if not self:isNetworkConnected() then
+        logger.info("wereaddesktop: finished status waiting for network:",
+            "book_id=", book_id)
+        self:showTransientInfo(
+            _("已在本地标记；连接网络后将自动同步。"), 3)
+        return true
+    end
+    self:syncPendingFinishedStatus(book_id)
+    return true
+end
+
+function WeReadDesktop:syncPendingFinishedStatus(book_id)
+    local bridge = self:finishStatusBridge()
+    if not bridge or not bridge.settings or not bridge.client
+        or type(bridge.client.mark_book_finished) ~= "function"
+        or not bridge.isLoggedIn or not bridge:isLoggedIn()
+        or not self:isNetworkConnected() then
+        return false
+    end
+    local settings = bridge.settings
+    if type(settings.refresh) == "function" then
+        settings:refresh(PENDING_FINISH_SYNC_KEY)
+    end
+    local pending = settings:get(PENDING_FINISH_SYNC_KEY, {})
+    if type(pending) ~= "table" then
+        return false
+    end
+    local current_account = settings:get("account", {})
+    local current_vid = type(current_account) == "table"
+        and tostring(current_account.user_vid or "") or ""
+    local ids = {}
+    if book_id ~= nil then
+        ids[1] = tostring(book_id)
+    else
+        for pending_book_id in pairs(pending) do
+            ids[#ids + 1] = tostring(pending_book_id)
+        end
+    end
+    self.finished_status_requests = self.finished_status_requests or {}
+    local scheduled = false
+    for _index, pending_book_id in ipairs(ids) do
+        local entry = pending[pending_book_id]
+        if type(entry) == "table"
+            and not self.finished_status_requests[pending_book_id] then
+            local queued_vid = tostring(entry.user_vid or "")
+            if queued_vid ~= "" and current_vid ~= ""
+                and queued_vid ~= current_vid then
+                pending[pending_book_id] = nil
+                self:savePendingFinishedStatus(settings, pending)
+                logger.warn("wereaddesktop: discarded finished status for"
+                    .. " another account:", "book_id=", pending_book_id)
+            else
+                scheduled = true
+                self.finished_status_requests[pending_book_id] = true
+                local target_finished = entry.finished == true
+                UIManager:scheduleIn(0.1, function()
+                    local call_ok, ok, _result, err = pcall(
+                        bridge.client.mark_book_finished,
+                        bridge.client,
+                        pending_book_id,
+                        target_finished
+                    )
+                    self.finished_status_requests[pending_book_id] = nil
+                    if call_ok and ok == true then
+                        if type(settings.refresh) == "function" then
+                            settings:refresh(PENDING_FINISH_SYNC_KEY)
+                        end
+                        local latest = settings:get(
+                            PENDING_FINISH_SYNC_KEY, {})
+                        local current = type(latest) == "table"
+                            and latest[pending_book_id] or nil
+                        if type(current) == "table"
+                            and current.finished == target_finished then
+                            latest[pending_book_id] = nil
+                            self:savePendingFinishedStatus(settings, latest)
+                            if type(bridge.updateShelfFinished) == "function" then
+                                bridge:updateShelfFinished(
+                                    pending_book_id, target_finished)
+                            end
+                            logger.info(
+                                "wereaddesktop: finished status synced:",
+                                "book_id=", pending_book_id,
+                                "finished=", tostring(target_finished))
+                            self:showTransientInfo(target_finished
+                                and _("已同步到微信读书：已读完")
+                                or _("已同步到微信读书：继续阅读"), 2)
+                        else
+                            self:syncPendingFinishedStatus(pending_book_id)
+                        end
+                    else
+                        local reason = call_ok and err or ok
+                        logger.warn(
+                            "wereaddesktop: finished status sync failed:",
+                            "book_id=", pending_book_id,
+                            "finished=", tostring(target_finished),
+                            "error=", tostring(reason))
+                        self:showTransientInfo(
+                            _("云端状态同步失败，联网后将自动重试。"), 3)
+                    end
+                end)
+            end
+        end
+    end
+    return scheduled
+end
+
+local THOUGHT_CACHE_MAX_AGE = 24 * 60 * 60
+
+function WeReadDesktop:thoughtBookDir(book_id)
+    if tostring(book_id) == tostring(self.current_weread_book_id) then
+        local path = self.ui.document and self.ui.document.file
+        local dir = type(path) == "string" and path:match("^(.*)/[^/]+$")
+        if dir then
+            return dir
+        end
+    end
+    local bridge = self:getReaderBridge()
+    local Content = require("weread.lib.content")
+    return Content.book_cache_dir(bridge.settings, book_id)
+end
+
+function WeReadDesktop:readThoughtCache(payload)
+    local ThoughtDB = require("weread.lib.thought_db")
+    local db = ThoughtDB.open(self:thoughtBookDir(payload.book_id))
+    if not db then
+        return nil
+    end
+    local ok, cached = pcall(
+        ThoughtDB.getRange, db, payload.chapter_uid, payload.range
+    )
+    ThoughtDB.close(db)
+    if not ok then
+        logger.warn("wereaddesktop: thought cache read failed:",
+            "book_id=", tostring(payload.book_id),
+            "chapter_uid=", tostring(payload.chapter_uid),
+            "range=", tostring(payload.range),
+            "error=", tostring(cached))
+        return nil
+    end
+    return cached
+end
+
+function WeReadDesktop:writeThoughtCache(payload, range_review, append)
+    local ThoughtDB = require("weread.lib.thought_db")
+    local db = ThoughtDB.open(self:thoughtBookDir(payload.book_id))
+    if not db then
+        return false
+    end
+    local call_ok, ok = pcall(
+        ThoughtDB.putRange, db, payload.chapter_uid, range_review, {
+            append = append == true,
+            fetched_at = os.time(),
+        }
+    )
+    ThoughtDB.close(db)
+    return call_ok and ok == true
+end
+
+local function cleanThoughtText(value)
+    value = tostring(value or ""):gsub("\r", "")
+    value = value:gsub("^%s+", ""):gsub("%s+$", "")
+    return value
+end
+
+function WeReadDesktop:formatThoughts(cached)
+    local items = cached and cached.items or {}
+    if #items == 0 then
+        return _("这里暂时没有书友想法。")
+    end
+    local lines = {}
+    local abstract = cleanThoughtText(items[1].abstract)
+    if abstract ~= "" then
+        lines[#lines + 1] = _("原文")
+        lines[#lines + 1] = abstract
+        lines[#lines + 1] = ""
+    end
+    for index, item in ipairs(items) do
+        local author = cleanThoughtText(item.author)
+        if author == "" then
+            author = _("匿名")
+        end
+        local likes = tonumber(item.likes_count) or 0
+        lines[#lines + 1] = string.format(
+            "%d. %s · %s %d", index, author, _("赞"), likes
+        )
+        lines[#lines + 1] = cleanThoughtText(item.content)
+        if index < #items then
+            lines[#lines + 1] = ""
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+function WeReadDesktop:showThoughts(payload, cached)
+    local TextViewer = require("ui/widget/textviewer")
+    local viewer
+    local actions = {}
+    if cached and cached.has_more then
+        actions[#actions + 1] = {
+            text = _("加载更多"),
+            callback = function()
+                UIManager:close(viewer)
+                self:fetchThoughtRange(payload, {
+                    append = true,
+                    max_idx = cached.max_idx,
+                    sync_key = cached.sync_key,
+                })
+            end,
+        }
+    end
+    local stale = not cached or not cached.fetched_at
+        or os.time() - cached.fetched_at > THOUGHT_CACHE_MAX_AGE
+    if stale then
+        actions[#actions + 1] = {
+            text = _("刷新"),
+            callback = function()
+                UIManager:close(viewer)
+                self:fetchThoughtRange(payload)
+            end,
+        }
+    end
+    local buttons = nil
+    if #actions > 0 then
+        buttons = { actions }
+    end
+    viewer = TextViewer:new{
+        title = _("书友想法"),
+        text = self:formatThoughts(cached),
+        show_menu = false,
+        buttons_table = buttons,
+        add_default_buttons = buttons ~= nil,
+    }
+    UIManager:show(viewer)
+end
+
+function WeReadDesktop:fetchThoughtRange(payload, opts)
+    opts = opts or {}
+    local key = table.concat({
+        payload.book_id, tostring(payload.chapter_uid), payload.range,
+    }, ":")
+    self.thought_requests = self.thought_requests or {}
+    if self.thought_requests[key] then
+        self:showTransientInfo(_("正在加载书友想法…"), 1)
+        return true
+    end
+    if not self:isNetworkOnline() then
+        self:showInfo(_("加载书友想法失败：无网络连接，请连接 Wi-Fi 后重试。"))
+        return true
+    end
+    local bridge = self:getReaderBridge()
+    if not bridge:isLoggedIn() then
+        self:showInfo(_("加载书友想法失败：请先登录微信读书。"))
+        return true
+    end
+
+    self.thought_requests[key] = true
+    self:showBusy(_("正在加载书友想法…"))
+    UIManager:scheduleIn(0.1, function()
+        local call_ok, ok, result, err = pcall(
+            bridge.client.get_chapter_reviews_batch,
+            bridge.client,
+            payload.book_id,
+            payload.chapter_uid,
+            {
+                {
+                    range = payload.range,
+                    maxIdx = tonumber(opts.max_idx) or 0,
+                    count = 20,
+                    synckey = tonumber(opts.sync_key) or 0,
+                },
+            }
+        )
+        self.thought_requests[key] = nil
+        self:closeBusy()
+        if not call_ok or not ok then
+            local reason = call_ok and err or ok
+            logger.warn("wereaddesktop: lazy thought fetch failed:",
+                "book_id=", tostring(payload.book_id),
+                "chapter_uid=", tostring(payload.chapter_uid),
+                "range=", payload.range,
+                "error=", tostring(reason))
+            self:showInfo(_("加载书友想法失败，请稍后重试。"))
+            return
+        end
+        local range_review
+        for _, review in ipairs(
+            type(result) == "table" and result.reviews or {}
+        ) do
+            if review.range == payload.range then
+                range_review = review
+                break
+            end
+        end
+        range_review = range_review or {
+            range = payload.range,
+            pageReviews = {},
+            hasMore = false,
+            maxIdx = 0,
+            synckey = 0,
+            totalCount = 0,
+        }
+        self:writeThoughtCache(payload, range_review, opts.append)
+        local cached = self:readThoughtCache(payload)
+        if not cached then
+            cached = {
+                items = Annotations.buildThoughtPopupItems(range_review),
+                fetched_at = os.time(),
+                max_idx = tonumber(range_review.maxIdx) or 0,
+                sync_key = tonumber(range_review.synckey) or 0,
+                total_count = tonumber(range_review.totalCount) or 0,
+                has_more = range_review.hasMore == true
+                    or tonumber(range_review.hasMore) == 1,
+            }
+        end
+        logger.info("wereaddesktop: lazy thought loaded:",
+            "book_id=", tostring(payload.book_id),
+            "chapter_uid=", tostring(payload.chapter_uid),
+            "range=", payload.range,
+            "items=", tostring(#(cached.items or {})),
+            "has_more=", tostring(cached.has_more == true))
+        self:showThoughts(payload, cached)
+    end)
+    return true
+end
+
+function WeReadDesktop:openThoughtLink(url)
+    local payload = Annotations.parseThoughtURL(url)
+    if not payload then
+        return false
+    end
+    local cached = self:readThoughtCache(payload)
+    logger.info("wereaddesktop: thought link tapped:",
+        "book_id=", tostring(payload.book_id),
+        "chapter_uid=", tostring(payload.chapter_uid),
+        "range=", payload.range,
+        "cache=", cached and "hit" or "miss")
+    if cached then
+        self:showThoughts(payload, cached)
+        return true
+    end
+    return self:fetchThoughtRange(payload)
+end
+
+function WeReadDesktop:readBookReviewCache(book_id)
+    local ThoughtDB = require("weread.lib.thought_db")
+    local db = ThoughtDB.open(self:thoughtBookDir(book_id))
+    if not db then
+        return nil
+    end
+    local ok, cached = pcall(ThoughtDB.getBookReviews, db)
+    ThoughtDB.close(db)
+    if not ok then
+        logger.warn("wereaddesktop: book review cache read failed:",
+            "book_id=", tostring(book_id), "error=", tostring(cached))
+        return nil
+    end
+    return cached
+end
+
+function WeReadDesktop:writeBookReviewCache(book_id, page, append)
+    local ThoughtDB = require("weread.lib.thought_db")
+    local db = ThoughtDB.open(self:thoughtBookDir(book_id))
+    if not db then
+        return false
+    end
+    local call_ok, ok = pcall(ThoughtDB.putBookReviews, db, page, {
+        append = append == true,
+        fetched_at = os.time(),
+    })
+    ThoughtDB.close(db)
+    return call_ok and ok == true
+end
+
+local function normalizeBookReviewPage(result)
+    local page = {
+        items = {},
+        sync_key = tonumber(result and result.synckey) or 0,
+        total_count = tonumber(result and result.reviewsCnt) or 0,
+        has_more = result and (result.reviewsHasMore == true
+            or tonumber(result.reviewsHasMore) == 1) or false,
+        max_idx = 0,
+    }
+    for sequence, entry in ipairs(
+        type(result) == "table" and result.reviews or {}
+    ) do
+        local wrapper = type(entry.review) == "table" and entry.review or {}
+        local review = type(wrapper.review) == "table"
+            and wrapper.review or wrapper
+        local author = type(review.author) == "table" and review.author or {}
+        local index = tonumber(entry.idx) or sequence
+        page.max_idx = math.max(page.max_idx, index)
+        page.items[#page.items + 1] = {
+            item_index = index,
+            review_id = tostring(
+                wrapper.reviewId or review.reviewId or ("idx-" .. index)
+            ),
+            author = tostring(author.name or author.nick or "匿名"),
+            content = cleanThoughtText(review.content or ""),
+            rating = tonumber(review.newRatingLevel) or 0,
+            likes_count = tonumber(wrapper.likesCount
+                or review.likesCount) or 0,
+            created_at = tonumber(review.createTime) or 0,
+        }
+    end
+    return page
+end
+
+local BOOK_REVIEW_RATING = {
+    [1] = _("推荐本书"),
+    [2] = _("认为一般"),
+    [3] = _("不推荐"),
+}
+
+function WeReadDesktop:formatBookReviews(cached)
+    local items = cached and cached.items or {}
+    if #items == 0 then
+        return _("这里暂时没有书友点评。")
+    end
+    local lines = {}
+    for index, item in ipairs(items) do
+        local author = cleanThoughtText(item.author)
+        if author == "" then
+            author = _("匿名")
+        end
+        local rating = BOOK_REVIEW_RATING[tonumber(item.rating)]
+        local meta = author
+        if rating then
+            meta = meta .. " · " .. rating
+        end
+        meta = meta .. string.format(" · %s %d",
+            _("赞"), tonumber(item.likes_count) or 0)
+        lines[#lines + 1] = string.format("%d. %s", index, meta)
+        lines[#lines + 1] = cleanThoughtText(item.content)
+        if index < #items then
+            lines[#lines + 1] = ""
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+function WeReadDesktop:showBookReviews(book_id, cached)
+    local TextViewer = require("ui/widget/textviewer")
+    local viewer
+    local actions = {}
+    if cached and cached.has_more then
+        actions[#actions + 1] = {
+            text = _("加载更多"),
+            callback = function()
+                UIManager:close(viewer)
+                self:fetchBookReviews(book_id, {
+                    append = true,
+                    max_idx = cached.max_idx,
+                    sync_key = cached.sync_key,
+                })
+            end,
+        }
+    end
+    local stale = not cached or not cached.fetched_at
+        or os.time() - cached.fetched_at > THOUGHT_CACHE_MAX_AGE
+    if stale then
+        actions[#actions + 1] = {
+            text = _("刷新"),
+            callback = function()
+                UIManager:close(viewer)
+                self:fetchBookReviews(book_id)
+            end,
+        }
+    end
+    local buttons = #actions > 0 and { actions } or nil
+    viewer = TextViewer:new{
+        title = _("书友点评"),
+        text = self:formatBookReviews(cached),
+        show_menu = false,
+        buttons_table = buttons,
+        add_default_buttons = buttons ~= nil,
+    }
+    UIManager:show(viewer)
+end
+
+function WeReadDesktop:fetchBookReviews(book_id, opts)
+    opts = opts or {}
+    self.book_review_requests = self.book_review_requests or {}
+    local key = tostring(book_id)
+    if self.book_review_requests[key] then
+        self:showTransientInfo(_("正在加载书友点评…"), 1)
+        return true
+    end
+    if not self:isNetworkOnline() then
+        self:showInfo(_("加载书友点评失败：无网络连接，请连接 Wi-Fi 后重试。"))
+        return true
+    end
+    local bridge = self:getReaderBridge()
+    if not bridge:isLoggedIn() then
+        self:showInfo(_("加载书友点评失败：请先登录微信读书。"))
+        return true
+    end
+
+    self.book_review_requests[key] = true
+    self:showBusy(_("正在加载书友点评…"))
+    UIManager:scheduleIn(0.1, function()
+        local call_ok, ok, result, err = pcall(
+            bridge.client.get_book_reviews,
+            bridge.client,
+            book_id,
+            {
+                max_idx = tonumber(opts.max_idx) or 0,
+                sync_key = tonumber(opts.sync_key) or 0,
+                count = 20,
+            }
+        )
+        self.book_review_requests[key] = nil
+        self:closeBusy()
+        if not call_ok or not ok then
+            local reason = call_ok and err or ok
+            logger.warn("wereaddesktop: book review fetch failed:",
+                "book_id=", tostring(book_id),
+                "error=", tostring(reason))
+            self:showInfo(_("加载书友点评失败，请稍后重试。"))
+            return
+        end
+        local page = normalizeBookReviewPage(result)
+        self:writeBookReviewCache(book_id, page, opts.append)
+        local cached = self:readBookReviewCache(book_id)
+        if not cached then
+            cached = page
+            cached.fetched_at = os.time()
+        end
+        logger.info("wereaddesktop: book reviews loaded:",
+            "book_id=", tostring(book_id),
+            "items=", tostring(#page.items),
+            "has_more=", tostring(page.has_more == true))
+        self:showBookReviews(book_id, cached)
+    end)
+    return true
+end
+
+function WeReadDesktop:openBookReviews()
+    local book_id = self.current_weread_book_id
+    if not book_id then
+        self:showInfo(_("当前书籍不是通过微读下载的微信读书书籍。"))
+        return false
+    end
+    local cached = self:readBookReviewCache(book_id)
+    if cached then
+        self:showBookReviews(book_id, cached)
+        return true
+    end
+    return self:fetchBookReviews(book_id)
 end
 
 function WeReadDesktop:onPageUpdate()
@@ -373,10 +1118,34 @@ function WeReadDesktop:onPosUpdate()
     self:onPageUpdate()
 end
 
+-- Forward device lifecycle events so reading-time reports exclude time
+-- spent in screensaver/suspend. ProgressUploader keeps these idempotent.
+function WeReadDesktop:onSuspend()
+    if self.progress_uploader then
+        self.progress_uploader:onSuspend()
+    end
+end
+
+function WeReadDesktop:onResume()
+    if self.progress_uploader then
+        self.progress_uploader:onResume()
+    end
+end
+
 function WeReadDesktop:refreshDesktop()
     if self.desktop_widget then
+        self:refreshWifiAction()
         self.desktop_widget:setData(self:collectData())
     end
+end
+
+function WeReadDesktop:onNetworkConnected()
+    self:refreshDesktop()
+    self:syncPendingFinishedStatus()
+end
+
+function WeReadDesktop:onNetworkDisconnected()
+    self:refreshDesktop()
 end
 
 ----------------------------------------------------------------
@@ -510,34 +1279,33 @@ function WeReadDesktop:toggleNightMode()
 end
 
 function WeReadDesktop:wifiEnabled()
-    local ok, NetworkMgr = pcall(require, "ui/network/manager")
-    if not ok or not NetworkMgr or not NetworkMgr.isWifiOn then
-        return false
-    end
-    local ok_on, on = pcall(function()
-        return NetworkMgr:isWifiOn()
-    end)
-    return ok_on and on == true
+    local wifi_on = networkState()
+    return wifi_on
 end
 
--- Official path: 设置 → 网络 → Wi-Fi 连接 calls the same NetworkMgr
--- methods; the completion callback refreshes the row label.
+-- Mirror KOReader's official 设置 → 网络 → Wi-Fi 连接 three-state
+-- behavior, including the interactive flag needed by device backends.
 function WeReadDesktop:toggleWifi()
-    local ok, NetworkMgr = pcall(require, "ui/network/manager")
-    if not ok or not NetworkMgr then
+    local wifi_on, connected, NetworkMgr = networkState()
+    if not NetworkMgr then
         return
     end
     local done = function()
         self:refreshDesktop()
     end
-    if self:wifiEnabled() then
-        pcall(function()
-            NetworkMgr:toggleWifiOff(done)
-        end)
+    local ok_toggle, err
+    if wifi_on and connected then
+        ok_toggle, err = pcall(NetworkMgr.toggleWifiOff,
+            NetworkMgr, done, true)
+    elseif wifi_on and type(NetworkMgr.promptWifi) == "function" then
+        ok_toggle, err = pcall(NetworkMgr.promptWifi,
+            NetworkMgr, done, false, true)
     else
-        pcall(function()
-            NetworkMgr:toggleWifiOn(done)
-        end)
+        ok_toggle, err = pcall(NetworkMgr.toggleWifiOn,
+            NetworkMgr, done, false, true)
+    end
+    if not ok_toggle then
+        logger.warn("wereaddesktop: Wi-Fi toggle failed:", tostring(err))
     end
     self:refreshDesktop()
 end
@@ -1222,6 +1990,45 @@ function WeReadDesktop:collectData()
     return { login_prompt = true }
 end
 
+-- Top-bar actions are rebuilt by BookshelfWidget:setData(), but the action
+-- table itself lives outside data. Add/remove the Wi-Fi indicator before a
+-- rebuild so it follows the current connection state.
+function WeReadDesktop:refreshWifiAction()
+    local widget = self.desktop_widget
+    local actions = widget and widget.actions
+    if type(actions) ~= "table" then
+        return
+    end
+    local wifi_index
+    for i, action in ipairs(actions) do
+        if action.wereaddesktop_wifi_status or action.icon == "wifi" then
+            wifi_index = i
+            break
+        end
+    end
+    local connected = self:isNetworkConnected()
+    if not connected and wifi_index then
+        table.remove(actions, wifi_index)
+        return
+    end
+    if connected and not wifi_index then
+        local insert_at = #actions + 1
+        for i, action in ipairs(actions) do
+            if action.icon == "exit" then
+                insert_at = i
+                break
+            end
+        end
+        table.insert(actions, insert_at, {
+            icon = "wifi",
+            wereaddesktop_wifi_status = true,
+            callback = function()
+                self:showTransientInfo(_("Wi-Fi 已连接"), 1)
+            end,
+        })
+    end
+end
+
 function WeReadDesktop:showDesktop()
     if self.desktop_widget then
         return
@@ -1269,10 +2076,11 @@ function WeReadDesktop:showDesktop()
         },
     }
     -- Wi-Fi status indicator between settings and exit; only shown while
-    -- connected. Evaluated when the desktop is built.
+    -- connected. refreshWifiAction keeps it current after the build.
     if self:isNetworkConnected() then
         table.insert(actions, {
             icon = "wifi",
+            wereaddesktop_wifi_status = true,
             callback = function()
                 self:showTransientInfo(_("Wi-Fi 已连接"), 1)
             end,
@@ -1401,6 +2209,19 @@ end
 -- Single entry point in KOReader's main menu: opens the desktop. All
 -- settings live on the desktop's own settings tab.
 function WeReadDesktop:addToMainMenu(menu_items)
+    if self.ui.document then
+        menu_items.wereadbookreviews = {
+            text = _("书友点评"),
+            sorting_hint = "tools",
+            enabled_func = function()
+                return self.current_weread_book_id ~= nil
+            end,
+            callback = function()
+                self:openBookReviews()
+            end,
+        }
+        return
+    end
     menu_items.wereaddesktop = {
         text = _("微读"),
         sorting_hint = "tools",
