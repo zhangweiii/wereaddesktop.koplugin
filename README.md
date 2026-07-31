@@ -10,10 +10,17 @@
 - **全书下载**：把书架上的书打包成单个 EPUB 下载到本地阅读
 - **划线与书友想法**：下载微信读书划线；点击任一下划线按需加载当前范围的书友想法，已知有评论的位置带星号，并支持缓存和「加载更多」
 - **书友点评**：阅读微信书籍时可从 KOReader 工具菜单查看整本书的精选点评
+- **书架搜索与排序**：书架内可按书名/作者筛选，并按最近阅读、书名、进度或未读完排序
+- **阅读统计**：设置页可查看本周和累计阅读统计
+- **缓存管理**：设置页查看微读缓存占用；长按已下载书籍可删除本地 EPUB、章节和评论缓存
 - **出版社注释**：将书中出版社注释转换为标准 EPUB 脚注，点击后使用 KOReader 原生弹窗显示
-- **双向进度同步**：
-  - 上传：阅读中每 30 秒、打开/关闭书籍时自动上报进度和有效阅读时长；休眠时间不会计入
+- **可恢复的双向进度同步**：
+  - 在线上传：正常联网阅读时，每 30 秒及打开/关闭书籍时自动上报进度和新增的有效阅读时长；休眠时间不会计入
   - 下载：打开书时自动拉取云端进度，比本地新就跳转到最新位置（在手机微信读书上读的进度可以无缝接续）
+  - 离线/崩溃恢复：待上传位置和阅读时长先落盘；联网后只静默补传最新进度，历史离线时长继续保留在本地，书籍已经关闭也不需要重新打开
+  - 离线时长管理：设置页显示待上报时长；用户可手动开始后台上报，或只清除待上报时长而保留阅读进度
+  - 可靠补报：手动上报按每次最多 60 秒、间隔 61 秒串行处理；中断后保留剩余部分，只有收到云端 `synckey` 确认才扣减本地队列
+  - 补报期间阅读：可以继续阅读微信书籍；实时进度仍会以 `rt=0` 更新，补报开始前的历史时长与期间新增时长分开保存，不会被重复扣减或用旧位置覆盖新进度
 - **已读状态同步**：KOReader 读完弹窗中的「标记为读完/继续阅读」同步到微信读书云端；离线或失败时保留状态并在联网后重试
 - **状态栏**：时间、Wi-Fi 状态、设置和退出入口
 - **定时熄屏**：设置标签页可调整无操作自动休眠时长（关 / 5 / 15 / 30 / 60 分钟，复用 KOReader 内置 autosuspend 插件，默认 15 分钟）
@@ -43,14 +50,16 @@
 
 ## 使用
 
-- **书架**：点封面打开已下载的书；未下载的书会提示下载整本 EPUB；长按封面弹出下载选项（补齐缺失章节 / 重新下载整本）
+- **书架**：点封面打开已下载的书；未下载的书会提示下载整本 EPUB；长按已下载书籍可补齐缺失章节、重新下载整本或删除本地缓存
+- **本地筛选**：书架顶部搜索框只筛选本地已同步书架，不会修改微信读书云端数据；设置页可循环切换排序方式
 - **书城**：底部「书城」标签浏览推荐和搜索，搜索到的书同样可以下载
 - **下载补齐**：整本下载时部分章节失败，完成提示里可直接「补齐缺失章节」——只重下失败的章节并重新打包，已下载的章节来自本地缓存
 - **划线评论**：点击橙色下划线打开「书友想法」；带星号表示已知存在公开评论，普通热门划线也可点击，无评论时会显示空状态。评论按当前范围懒加载，不会在下载整本书时批量请求
 - **整本点评**：阅读微信书籍时，从 KOReader 主菜单「工具 → 书友点评」查看整本书精选点评
 - **标记读完**：读到书末后使用 KOReader 的读完弹窗，状态会同步到微信读书；同步失败会保留待办并在重新联网或再次打开书籍时重试
 - **设置**：底部「设置」标签或右上角齿轮打开 KOReader 设置菜单；「微读」菜单项在 KOReader 主菜单的「工具」分类下，可开关自动桌面、进度同步、登录/退出
-- **进度同步**：默认开启，可在「微读」菜单中关闭
+- **缓存与统计**：设置页的「微读缓存」显示本地占用和书籍明细；「阅读统计」读取微信读书本周/累计数据；长按已下载书籍可删除本地缓存
+- **进度与离线时长**：阅读进度默认开启同步，离线进度会在联网后以 `rt=0` 静默补传；离线阅读时长保留在本地，可在设置页「离线阅读时长」中选择后台上报或清除。后台补报耗时约为“分片数减一 × 61 秒”，期间设备会保持唤醒并可继续阅读；补报任务只处理启动时已经存在的历史时长，期间新增时长会独立保留，任务结束后可再次上报。由于服务端计时吞吐约为每分钟 60 秒，持续阅读时待上报总量可能暂时不会下降
 
 ## 开发
 
@@ -61,22 +70,38 @@ wereaddesktop.koplugin/
 ├── main.lua              -- 插件入口：桌面生命周期、菜单、进度同步接线
 ├── desktop.lua           -- 书架桌面 widget（书架/书城/设置三个标签页）
 ├── wereadbridge.lua      -- UI 与微信读书客户端库之间的桥接层
-├── progressuploader.lua  -- 阅读进度双向同步（阅读器上下文）
+├── progressuploader.lua  -- 阅读进度双向同步与离线队列补传
 ├── weread/               -- 微信读书协议、下载、划线与评论客户端库（衍生自 weread.koplugin，见 NOTICE）
+│   └── lib/storage.lua   -- 本地缓存统计与安全删除
 └── spec/                 -- 无头测试（luajit 直接运行）
 ```
 
-运行测试（需要一个 KOReader 源码 checkout 提供前端模块）：
+运行确定性无头测试：
+
+```sh
+cd wereaddesktop.koplugin
+luajit spec/test_progress_sync.lua
+luajit spec/test_posupdate_wiring.lua
+luajit spec/test_desktop_overlays.lua
+luajit spec/test_lazy_thoughts.lua
+luajit spec/test_lazy_thought_downloader.lua
+luajit spec/test_lazy_thought_reader.lua
+luajit spec/test_book_reviews_client.lua
+luajit spec/test_book_reviews_reader.lua
+luajit spec/test_finish_status_client.lua
+luajit spec/test_finish_status_sync.lua
+luajit spec/test_chapter_parts.lua
+luajit spec/test_storage.lua
+luajit spec/test_publisher_footnotes.lua
+luajit spec/test_updater.lua
+luajit spec/test_wifi_state.lua
+```
+
+跨实例设置合并测试还需要一个 KOReader 源码 checkout 提供 `luasettings` 等前端模块：
 
 ```sh
 cd wereaddesktop.koplugin
 KOREADER_DIR=/path/to/koreader luajit spec/smoke_settings_merge.lua
-luajit spec/test_progress_sync.lua
-luajit spec/test_posupdate_wiring.lua
-luajit spec/test_lazy_thoughts.lua
-luajit spec/test_lazy_thought_reader.lua
-luajit spec/test_finish_status_sync.lua
-luajit spec/test_updater.lua
 ```
 
 更新器的真实解压测试需要一个已经构建好的 KOReader 运行目录：
@@ -88,7 +113,12 @@ PLUGIN_DIR=/absolute/path/to/wereaddesktop.koplugin
     ./luajit "$PLUGIN_DIR/spec/test_updater_install.lua")
 ```
 
-`spec/e2e_real_upload.lua`、`spec/e2e_cloud_pull.lua` 和 `spec/e2e_read_time.lua` 是针对真实账号的端到端脚本，会读写真实服务器数据，仅供手动调试使用，用法见文件头注释。
+`spec/e2e_real_upload.lua`、`spec/e2e_cloud_pull.lua`、`spec/e2e_read_time.lua` 和 `spec/e2e_offline_read_time.lua` 是针对真实账号的端到端脚本，其中上传与阅读时长脚本会读写真实服务器数据，仅供手动调试使用，用法见文件头注释。
+
+### GitHub Actions
+
+- `.github/workflows/test.yml`：在每次 push 和 Pull Request 时自动运行 LuaJIT 编译检查、确定性回归测试，并验证发布压缩包可以生成；它不会登录微信读书，也不会部署到设备。
+- `.github/workflows/release.yml`：推送 `v*` 版本标签时自动构建 tar.gz 并创建 GitHub Release。
 
 ## 发布
 
@@ -96,7 +126,7 @@ PLUGIN_DIR=/absolute/path/to/wereaddesktop.koplugin
 
 1. 更新 `wereaddesktop_version.lua` 中的版本号。
 2. 运行 `sh tools/release.sh` 生成 `dist/wereaddesktop.koplugin-v<版本>.tar.gz`。
-3. 在 GitHub 上打 `v<版本>` 标签并创建 Release，把该 tar.gz 作为附件上传（插件的「检查更新」只认 `.tar.gz` 附件，且压缩包根目录必须是 `wereaddesktop.koplugin/`）。
+3. 提交版本号后，在 GitHub 上推送 `v<版本>` 标签：`release.yml` 会自动构建 tar.gz 并创建 Release（插件的「检查更新」只认 `.tar.gz` 附件，且压缩包根目录必须是 `wereaddesktop.koplugin/`）。
 4. 发布仓库已配置在 `wereaddesktop.koplugin/updater.lua` 的 `GITHUB_REPO` 常量（当前为 `zhangweiii/wereaddesktop.koplugin`）；如需临时指向其它仓库（测试 fork），可通过 KOReader 设置 `wereaddesktop_update_repo` 覆盖。
 
 ## 许可证与致谢

@@ -94,6 +94,7 @@ function Settings:new()
         -- there), so it must be initialized before any set/flush.
         _dirty = {},
         _dirty_books = {},
+        _removed_books = {},
     }, self)
     obj.store = LuaSettings:open(obj.settings_file)
     -- cache_dir is the download root; defaults to <data_dir>/cache unless overridden.
@@ -193,6 +194,7 @@ end
 
 function Settings:set(key, value)
     if key == "books" and type(value) == "table" then
+        local previous = self.store:readSetting("books", {})
         local indexes = {}
         for book_id, book in pairs(value) do
             local ok, index_or_err = BookStore.save(self, book_id, book)
@@ -201,6 +203,12 @@ function Settings:set(key, value)
             end
             indexes[book_id] = index_or_err
             self._dirty_books[book_id] = true
+            self._removed_books[book_id] = nil
+        end
+        for book_id in pairs(previous or {}) do
+            if indexes[book_id] == nil then
+                self._removed_books[book_id] = true
+            end
         end
         value = indexes
     end
@@ -240,6 +248,9 @@ function Settings:flush()
             for book_id in pairs(self._dirty_books) do
                 disk.books[book_id] = self.store.data.books[book_id]
             end
+            for book_id in pairs(self._removed_books) do
+                disk.books[book_id] = nil
+            end
         else
             disk[key] = self.store.data[key]
         end
@@ -247,6 +258,7 @@ function Settings:flush()
     self.store:reset(disk)
     self._dirty = {}
     self._dirty_books = {}
+    self._removed_books = {}
     self.store:flush()
 end
 

@@ -353,6 +353,7 @@ function QRLogin:_show_qr(uid, generation)
     local qr_size = math.floor(math.min(screen_width, screen_height) * 0.72)
     local dialog
     dialog = QRMessage:new{
+        modal = true,
         text = BASE_URL .. "/web/confirm?uid=" .. WeRead.urlencode(uid),
         -- QRMessage centers its framed content on the screen. Keeping the frame
         -- smaller than the viewport makes it a dismissible popup instead of a
@@ -372,7 +373,11 @@ function QRLogin:_show_qr(uid, generation)
         scale_factor = 0.9,
     }
     self.qr_dialog = dialog
-    UIManager:show(dialog)
+    if type(self.host.showOverlay) == "function" then
+        self.host:showOverlay(dialog)
+    else
+        UIManager:show(dialog, "full")
+    end
     self.host:refreshUI()
 
     UIManager:scheduleIn(0.5, function()
@@ -456,6 +461,7 @@ function QRLogin:_show_otp(uid, generation, error_message)
 
     local dialog
     dialog = InputDialog:new{
+        modal = true,
         title = _("Verification code required"),
         input = "",
         input_type = "text",

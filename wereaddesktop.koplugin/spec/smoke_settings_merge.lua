@@ -166,7 +166,12 @@ check("A's key is written", disk.fm_marker == "from-fm")
 A:set("books", { book1 = { title = "Book One", cached_file = ROOT .. "/cache/book1/book1.epub" } })
 A:flush()
 local b_books = B:get("books", {}) -- reader's (pre-A-download) view
-b_books.book2 = { title = "Book Two", cached_file = ROOT .. "/cache/book2/book2.epub", progress = 42 }
+b_books.book2 = {
+    title = "Book Two",
+    cached_file = ROOT .. "/cache/book2/book2.epub",
+    progress = 42,
+    pending_replay_elapsed = 60,
+}
 B:set("books", b_books)
 B:flush()
 disk = disk_settings()
@@ -179,6 +184,8 @@ check("book1 data loads through BookStore",
     C:get("books", {}).book1.title == "Book One")
 check("book2 progress persists through BookStore",
     C:get("books", {}).book2.progress == 42)
+check("book2 replay bucket persists through BookStore",
+    C:get("books", {}).book2.pending_replay_elapsed == 60)
 
 -- 4. Deletion propagates: A removes its marker; B's keys stay.
 A:set("fm_marker", nil)
@@ -202,6 +209,18 @@ A:flush()
 disk = disk_settings()
 check("dirty key flushed after refresh skip",
     disk.wereaddesktop_shelf[1].progress == 0.5)
+
+-- 6. Removing one book must remove only its index entry; the per-book merge
+-- logic must not resurrect it from the current disk snapshot.
+local c_books = C:get("books", {})
+c_books.book1 = nil
+C:set("books", c_books)
+C:flush()
+disk = disk_settings()
+check("deleted book index entry is gone",
+    type(disk.books) == "table" and disk.books.book1 == nil)
+check("remaining book index entry survives deletion",
+    type(disk.books) == "table" and type(disk.books.book2) == "table")
 
 os.remove(ROOT .. "/settings/weread.lua")
 os.execute("rm -rf " .. string.format("%q", ROOT))

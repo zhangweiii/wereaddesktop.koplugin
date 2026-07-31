@@ -1,0 +1,52 @@
+name: Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y luajit
+
+      - name: Compile every Lua file
+        run: |
+          set -eu
+          while IFS= read -r -d '' file; do
+            luajit -b "$file" /tmp/wereaddesktop-check.out
+          done < <(find wereaddesktop.koplugin -type f -name '*.lua' -print0)
+
+      - name: Run deterministic regression tests
+        working-directory: wereaddesktop.koplugin
+        run: |
+          set -eu
+          for test in \
+            spec/test_progress_sync.lua \
+            spec/test_posupdate_wiring.lua \
+            spec/test_desktop_overlays.lua \
+            spec/test_lazy_thoughts.lua \
+            spec/test_lazy_thought_downloader.lua \
+            spec/test_lazy_thought_reader.lua \
+            spec/test_book_reviews_client.lua \
+            spec/test_book_reviews_reader.lua \
+            spec/test_finish_status_client.lua \
+            spec/test_finish_status_sync.lua \
+            spec/test_chapter_parts.lua \
+            spec/test_storage.lua \
+            spec/test_publisher_footnotes.lua \
+            spec/test_updater.lua \
+            spec/test_wifi_state.lua; do
+            echo "== $test =="
+            luajit "$test"
+          done
+
+      - name: Build release archive
+        run: sh tools/release.sh

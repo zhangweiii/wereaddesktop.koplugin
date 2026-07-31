@@ -15,6 +15,10 @@ local Annotations = require("weread.lib.annotations")
 local logger = require("logger")
 local _ = require("gettext")
 
+local function formatStorageBytes(bytes)
+    return require("weread.lib.storage").format_bytes(bytes)
+end
+
 local WeReadDesktop = WidgetContainer:extend{
     name = "wereaddesktop",
     is_doc_only = false,
@@ -261,7 +265,8 @@ function WeReadDesktop:onCloseDocument()
 end
 
 ----------------------------------------------------------------
--- WeRead progress sync (reader context, upload only).
+-- WeRead progress sync. The reader instance captures live positions; either
+-- reader or file-manager context can replay durable offline entries.
 --
 -- The plugin module is instantiated in both the file manager and the
 -- reader; in the reader only this section is active. All uploads run
@@ -779,13 +784,14 @@ function WeReadDesktop:showThoughts(payload, cached)
         buttons = { actions }
     end
     viewer = TextViewer:new{
+        modal = true,
         title = _("书友想法"),
         text = self:formatThoughts(cached),
         show_menu = false,
         buttons_table = buttons,
         add_default_buttons = buttons ~= nil,
     }
-    UIManager:show(viewer)
+    self:showOverlay(viewer)
 end
 
 function WeReadDesktop:fetchThoughtRange(payload, opts)
@@ -1023,13 +1029,14 @@ function WeReadDesktop:showBookReviews(book_id, cached)
     end
     local buttons = #actions > 0 and { actions } or nil
     viewer = TextViewer:new{
+        modal = true,
         title = _("书友点评"),
         text = self:formatBookReviews(cached),
         show_menu = false,
         buttons_table = buttons,
         add_default_buttons = buttons ~= nil,
     }
-    UIManager:show(viewer)
+    self:showOverlay(viewer)
 end
 
 function WeReadDesktop:fetchBookReviews(book_id, opts)
@@ -1142,10 +1149,674 @@ end
 function WeReadDesktop:onNetworkConnected()
     self:refreshDesktop()
     self:syncPendingFinishedStatus()
+    -- Progress is lightweight and safe to sync silently. Historical offline
+    -- reading time stays local until the user starts its paced replay.
+    self:syncPendingReadingProgress{ progress_only = true }
+end
+
+-- Replay every durable reading-progress entry when connectivity returns. An
+-- open book reuses its live uploader; closed books use short-lived headless
+-- uploaders so the user does not need to reopen each title manually.
+function WeReadDesktop:syncPendingReadingProgress(options)
+    options = options or {}
+    if G_reader_settings:readSetting("wereaddesktop_progress_sync") == false
+        or not self:isNetworkConnected() then
+        return false
+    end
+    local bridge = self.reader_bridge or self.weread
+    if not bridge or not bridge.settings or not bridge.client
+        or not bridge.isLoggedIn or not bridge:isLoggedIn() then
+        return false
+    end
+    local settings = bridge.settings
+    if type(settings.refresh) == "function" then
+        settings:refresh("books")
+    end
+    local books = settings:get("books", {})
+    local ids = {}
+    for book_id, book in pairs(type(books) == "table" and books or {}) do
+        if type(book) == "table"
+            and type(book.pending_upload_position) == "table" then
+            ids[#ids + 1] = tostring(book_id)
+        end
+    end
+    table.sort(ids)
+    self.pending_progress_uploaders = self.pending_progress_uploaders or {}
+    local scheduled = false
+    for _, book_id in ipairs(ids) do
+        local active = self.progress_uploader
+        if active and tostring(active.book_id or "") == book_id then
+            scheduled = active:retryPending(book_id, options) or scheduled
+        elseif not self.pending_progress_uploaders[book_id] then
+            local uploader
+            uploader = ProgressUploader:new{
+                settings = settings,
+                client = bridge.client,
+                scheduler = UIManager,
+                is_online = function()
+                    return self:isNetworkConnected()
+                end,
+                heartbeat_interval = false,
+                on_uploaded = function(uploaded_book_id, position)
+                    if type(bridge.updateShelfProgress) == "function" then
+                        bridge:updateShelfProgress(uploaded_book_id,
+                            position and position.fraction)
+                    end
+                end,
+                on_finished = function(finished_book_id)
+                    finished_book_id = tostring(finished_book_id or book_id)
+                    if self.pending_progress_uploaders[finished_book_id]
+                        == uploader then
+                        self.pending_progress_uploaders[finished_book_id] = nil
+                    end
+                    self:refreshDesktop()
+                end,
+            }
+            self.pending_progress_uploaders[book_id] = uploader
+            if uploader:retryPending(book_id, options) then
+                scheduled = true
+            else
+                self.pending_progress_uploaders[book_id] = nil
+            end
+        end
+    end
+    return scheduled
+end
+
+-- Manually drain queued reading time. Books are processed one at a time and
+-- separated by the same 61-second accounting window used between chunks;
+-- parallel book queues would otherwise make the server credit only one. The
+-- coordinator snapshots the backlog at start, while time read during this run
+-- stays in the normal pending bucket for a later pass.
+function WeReadDesktop:startPendingReadingTimeUpload()
+    if self.pending_time_upload_active then
+        self:showTransientInfo(_("离线阅读时长正在上报中"), 2)
+        return false
+    end
+    if not self:isNetworkConnected() then
+        self:showInfo(_("无法上报：请先连接 Wi-Fi。"))
+        return false
+    end
+    local bridge = self.reader_bridge or self.weread
+    if not bridge or not bridge.settings or not bridge.client
+        or not bridge.isLoggedIn or not bridge:isLoggedIn() then
+        self:showInfo(_("无法上报：请先登录微信读书。"))
+        return false
+    end
+    local begin_ok, replay_token, ids, begin_err = pcall(
+        ProgressUploader.beginTimeReplay, bridge.settings)
+    if not begin_ok then
+        logger.err("wereaddesktop: offline-time coordinator failed:",
+            tostring(replay_token))
+        self:showInfo(_("离线阅读时长上报未能启动，可稍后重试。"))
+        return false
+    end
+    if not replay_token then
+        if begin_err == "already_active" then
+            self:showTransientInfo(_("离线阅读时长正在上报中"), 2)
+            return false
+        end
+        if begin_err ~= "empty" then
+            self:showInfo(_("离线阅读时长上报未能启动，可稍后重试。"))
+            return false
+        end
+        self:showTransientInfo(_("没有待上报的离线阅读时长"), 2)
+        return false
+    end
+
+    self.pending_time_upload_active = true
+    self.pending_time_upload_queue = ids
+    self.pending_time_upload_token = replay_token
+    local standby_held = false
+    if type(bridge.acquireStandbyGuard) == "function" then
+        local ok, err = pcall(bridge.acquireStandbyGuard, bridge)
+        standby_held = ok
+        if not ok then
+            logger.warn("wereaddesktop: offline-time standby guard failed:",
+                tostring(err))
+        end
+    end
+    local finished = false
+    local function finish(message, completed)
+        if finished then
+            return
+        end
+        finished = true
+        self.pending_time_upload_active = false
+        self.pending_time_upload_queue = nil
+        self.pending_time_upload_token = nil
+        local end_ok, ended = pcall(
+            ProgressUploader.endTimeReplay, replay_token, os.time())
+        if not end_ok or not ended then
+            logger.err("wereaddesktop: offline-time coordinator release failed:",
+                tostring(ended))
+        end
+        if standby_held then
+            standby_held = false
+            pcall(bridge.releaseStandbyGuard, bridge)
+        end
+        self:refreshDesktop()
+        if completed then
+            local remaining = bridge:getPendingUploadSummary()
+            if (tonumber(remaining.elapsed) or 0) > 0 then
+                message = string.format(
+                    _("本轮离线时长已上报；阅读期间新增时长已保留，可稍后继续（%s）"),
+                    self:syncStatusLabel(remaining))
+            else
+                message = _("离线阅读时长已全部上报")
+            end
+        end
+        if message then
+            self:showTransientInfo(message, 3)
+        end
+    end
+    local uploadNext
+    local function runUploadNext()
+        local ok, err = xpcall(uploadNext, debug.traceback)
+        if not ok then
+            logger.err("wereaddesktop: offline-time upload failed:",
+                tostring(err))
+            finish(_("离线阅读时长上报已暂停，可稍后继续"))
+        end
+    end
+    uploadNext = function()
+        if not self.pending_time_upload_active then
+            return
+        end
+        if not self:isNetworkConnected() then
+            finish(_("离线阅读时长上报已暂停，联网后可继续"))
+            return
+        end
+        local book_id = table.remove(self.pending_time_upload_queue, 1)
+        if not book_id then
+            finish(nil, true)
+            return
+        end
+        local uploader
+        uploader = ProgressUploader:new{
+            settings = bridge.settings,
+            client = bridge.client,
+            scheduler = UIManager,
+            is_online = function()
+                return self:isNetworkConnected()
+            end,
+            heartbeat_interval = false,
+            time_bucket = "replay",
+            on_uploaded = function(uploaded_book_id, position)
+                if type(bridge.updateShelfProgress) == "function" then
+                    bridge:updateShelfProgress(uploaded_book_id,
+                        position and position.fraction)
+                end
+            end,
+            on_finished = function()
+                local ok, err = xpcall(function()
+                    local current = bridge.settings:get("books", {})[book_id]
+                    if type(current) == "table"
+                        and (tonumber(current.pending_replay_elapsed) or 0) > 0 then
+                        finish(_("离线阅读时长上报已暂停，可稍后继续"))
+                        return
+                    end
+                    if #self.pending_time_upload_queue > 0 then
+                        pcall(self.refreshDesktop, self)
+                        UIManager:scheduleIn(61, runUploadNext)
+                    else
+                        finish(nil, true)
+                    end
+                end, debug.traceback)
+                if not ok then
+                    logger.err("wereaddesktop: offline-time completion failed:",
+                        tostring(err))
+                    finish(_("离线阅读时长上报已暂停，可稍后继续"))
+                end
+            end,
+        }
+        local ok, started = pcall(uploader.retryPending, uploader, book_id,
+            { include_pending_time = true })
+        if not ok then
+            logger.err("wereaddesktop: offline-time retry failed:",
+                tostring(started))
+        end
+        if not ok or not started then
+            finish(_("离线阅读时长上报未能启动，可稍后重试"))
+        end
+    end
+    runUploadNext()
+    return true
 end
 
 function WeReadDesktop:onNetworkDisconnected()
     self:refreshDesktop()
+end
+
+----------------------------------------------------------------
+-- Shelf search and local ordering. Keep this presentation state outside
+-- the persisted cloud shelf so a temporary filter never changes account data.
+----------------------------------------------------------------
+
+local SHELF_SORTS = {
+    { key = "time_desc", label = _("最近阅读") },
+    { key = "title_asc", label = _("书名") },
+    { key = "progress_desc", label = _("阅读进度") },
+    { key = "unfinished", label = _("未读完") },
+}
+
+local function shelf_text(book)
+    return tostring(book and (book.text or book.title or "") or "")
+end
+
+function WeReadDesktop:shelfSortOrder()
+    local shelf = self.weread and self.weread.settings
+        and self.weread.settings:get("shelf", {}) or {}
+    local key = type(shelf) == "table" and shelf.sort_order or nil
+    for _, entry in ipairs(SHELF_SORTS) do
+        if entry.key == key then
+            return key
+        end
+    end
+    return SHELF_SORTS[1].key
+end
+
+function WeReadDesktop:shelfSortLabel()
+    local key = self:shelfSortOrder()
+    for _, entry in ipairs(SHELF_SORTS) do
+        if entry.key == key then
+            return entry.label
+        end
+    end
+    return SHELF_SORTS[1].label
+end
+
+function WeReadDesktop:cycleShelfSort()
+    if not self.weread then
+        return
+    end
+    local current = self:shelfSortOrder()
+    local next_key = SHELF_SORTS[1].key
+    for index, entry in ipairs(SHELF_SORTS) do
+        if entry.key == current then
+            next_key = SHELF_SORTS[index % #SHELF_SORTS + 1].key
+            break
+        end
+    end
+    local shelf = self.weread.settings:get("shelf", {})
+    if type(shelf) ~= "table" then
+        shelf = {}
+    end
+    shelf.sort_order = next_key
+    self.weread.settings:set("shelf", shelf)
+    self.weread.settings:flush()
+    self:showTransientInfo(_("书架排序：") .. self:shelfSortLabel(), 2)
+    self:refreshDesktop()
+end
+
+function WeReadDesktop:showShelfSearch(current)
+    if not self.weread then
+        return
+    end
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        modal = true,
+        title = _("搜索本地书架"),
+        input = current or "",
+        buttons = {
+            {
+                {
+                    text = _("清除"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self.shelf_query = nil
+                        self:refreshDesktop()
+                    end,
+                },
+                {
+                    text = _("搜索"),
+                    is_enter_default = true,
+                    callback = function()
+                        local query = tostring(dialog:getInputText() or "")
+                            :gsub("^%s+", ""):gsub("%s+$", "")
+                        UIManager:close(dialog)
+                        self.shelf_query = query ~= "" and query or nil
+                        self:refreshDesktop()
+                    end,
+                },
+            },
+        },
+    }
+    self:showInputDialog(dialog)
+end
+
+function WeReadDesktop:filteredShelfBooks(books)
+    local result = {}
+    local query = self.shelf_query
+    query = query and query:lower() or nil
+    for _, book in ipairs(books or {}) do
+        local haystack = (shelf_text(book) .. " "
+            .. tostring(book.authors or "") .. " "
+            .. tostring(book.book_id or "")):lower()
+        if not query or haystack:find(query, 1, true) then
+            result[#result + 1] = book
+        end
+    end
+    local sort_order = self:shelfSortOrder()
+    table.sort(result, function(left, right)
+        if sort_order == "title_asc" then
+            return shelf_text(left) < shelf_text(right)
+        elseif sort_order == "progress_desc" then
+            local lp = tonumber(left.progress) or 0
+            local rp = tonumber(right.progress) or 0
+            if lp ~= rp then
+                return lp > rp
+            end
+        elseif sort_order == "unfinished" then
+            local lf = left.finished == true
+            local rf = right.finished == true
+            if lf ~= rf then
+                return not lf
+            end
+        end
+        local lt = tonumber(left.last_read_time or left.read_update_time) or 0
+        local rt = tonumber(right.last_read_time or right.read_update_time) or 0
+        if lt ~= rt then
+            return lt > rt
+        end
+        return shelf_text(left) < shelf_text(right)
+    end)
+    return result
+end
+
+function WeReadDesktop:formatStorageSummary(summary)
+    summary = summary or {}
+    local lines = {
+        _("本地缓存"),
+        string.format(_("%d 本书 · %s · %d 个文件"),
+            tonumber(summary.book_count) or 0,
+            formatStorageBytes(summary.bytes),
+            tonumber(summary.files) or 0),
+        "",
+    }
+    for _, book in ipairs(summary.books or {}) do
+        lines[#lines + 1] = string.format("%s · %s",
+            shelf_text(book),
+            formatStorageBytes(book.bytes))
+    end
+    if #summary.books == 0 then
+        lines[#lines + 1] = _("暂无本地下载缓存。")
+    end
+    return table.concat(lines, "\n")
+end
+
+function WeReadDesktop:showStorageManager()
+    if not self.weread then
+        return
+    end
+    local TextViewer = require("ui/widget/textviewer")
+    local ok, summary = pcall(self.weread.getStorageSummary, self.weread)
+    if not ok then
+        logger.warn("wereaddesktop: storage summary failed:", tostring(summary))
+        self:showInfo(_("读取缓存信息失败，请稍后重试。"))
+        return
+    end
+    self:showOverlay(TextViewer:new{
+        modal = true,
+        title = _("微读缓存"),
+        text = self:formatStorageSummary(summary),
+        show_menu = false,
+    })
+end
+
+local function formatDuration(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    local remain = seconds % 60
+    if hours > 0 then
+        if minutes > 0 then
+            return string.format(_("%d小时%d分钟"), hours, minutes)
+        end
+        return string.format(_("%d小时"), hours)
+    end
+    if minutes > 0 then
+        return string.format(_("%d分钟"), minutes)
+    end
+    return string.format(_("%d秒"), remain)
+end
+
+function WeReadDesktop:syncStatusLabel(summary)
+    if self.pending_time_upload_active then
+        return _("正在上报")
+    end
+    if not summary or (tonumber(summary.elapsed) or 0) <= 0 then
+        return _("无待上报")
+    end
+    return string.format(_("待上报 %s"), formatDuration(summary.elapsed))
+end
+
+function WeReadDesktop:showSyncStatus()
+    if not self.weread then
+        return
+    end
+    local summary = self.weread:getPendingUploadSummary()
+    if (tonumber(summary.elapsed) or 0) <= 0 then
+        self:showTransientInfo(_("没有待上报的离线阅读时长；阅读进度会在联网后自动同步。"), 3)
+        return
+    end
+    local chunks = tonumber(summary.replay_chunks)
+        or math.ceil((tonumber(summary.elapsed) or 0) / 60)
+    local estimate = math.max(0, chunks - 1) * 61
+        + math.ceil(ProgressUploader.timeReplayStartDelay(os.time()))
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+    dialog = ButtonDialog:new{
+        modal = true,
+        dismissable = false,
+        title = string.format(
+            _("%d 本书共 %s待上报。微信接口需要分段处理，预计约 %s完成。请保持 Wi-Fi 连接；期间可以继续阅读，新增时长会单独保留，避免重复上报。"),
+            tonumber(summary.time_count) or tonumber(summary.count) or 0,
+            formatDuration(summary.elapsed), formatDuration(estimate)),
+        buttons = {
+            {
+                {
+                    text = _("开始后台上报"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        if self:startPendingReadingTimeUpload() then
+                            self:showTransientInfo(
+                                _("已开始上报；设备会保持唤醒，可以继续阅读"), 3)
+                        end
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("清除待上报时长"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        if self.pending_time_upload_active then
+                            self:showInfo(_("上报正在进行，完成或暂停后再清除。"))
+                            return
+                        end
+                        local ConfirmBox = require("ui/widget/confirmbox")
+                        self:showOverlay(ConfirmBox:new{
+                            modal = true,
+                            text = _("确定清除全部待上报的离线阅读时长吗？阅读进度不会被清除，并仍会在联网后自动同步。"),
+                            ok_text = _("清除"),
+                            ok_callback = function()
+                                local cleared_count, elapsed =
+                                    self.weread:clearPendingUploadElapsed()
+                                self:showTransientInfo(string.format(
+                                    _("已清除 %d 本书、%s待上报时长"),
+                                    cleared_count, formatDuration(elapsed)), 3)
+                                self:refreshDesktop()
+                            end,
+                            cancel_text = _("取消"),
+                        })
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("取消"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    self:showOverlay(dialog)
+end
+
+-- The detail endpoint has changed field names a few times. Keep the UI
+-- product-facing and map the known aliases instead of dumping the response
+-- table (which exposes JSON-like keys and protocol metadata to users).
+local STAT_FIELDS = {
+    {
+        label = _("阅读时长"),
+        kind = "duration",
+        keys = { "readtime", "readingtime", "readtimeseconds",
+            "readingtimeseconds", "readtimeminutes" },
+    },
+    {
+        label = _("累计阅读时长"),
+        kind = "duration",
+        keys = { "totalreadtime", "allreadtime", "cumulativereadtime" },
+    },
+    {
+        label = _("阅读天数"),
+        kind = "days",
+        keys = { "readdaynum", "readdaycount", "readdays",
+            "readingdays", "daycount", "days" },
+    },
+    {
+        label = _("阅读书籍"),
+        kind = "books",
+        keys = { "readbooknum", "readbookcount", "readingbooknum",
+            "readingbookcount", "bookcount" },
+    },
+    {
+        label = _("读完书籍"),
+        kind = "books",
+        keys = { "finishedbooknum", "finishedbookcount", "finishbooknum",
+            "finishbookcount", "finishedbooks" },
+    },
+    {
+        label = _("连续阅读"),
+        kind = "days",
+        keys = { "streak", "continuousreadingdays",
+            "consecutivereadingdays", "consecutivedays" },
+    },
+}
+
+local STAT_WRAPPERS = { "data", "result", "detail", "readingdata" }
+
+local function statKey(value)
+    return tostring(value):gsub("[_%-%s]", ""):lower()
+end
+
+local function unwrapStats(value)
+    if type(value) ~= "table" then
+        return {}
+    end
+    for _, key in ipairs(STAT_WRAPPERS) do
+        local wrapped = value[key]
+        if type(wrapped) == "table" then
+            return wrapped
+        end
+    end
+    return value
+end
+
+local function findStatValue(data, aliases)
+    local wanted = {}
+    for _, alias in ipairs(aliases) do
+        wanted[alias] = true
+    end
+    for key, value in pairs(data) do
+        if wanted[statKey(key)] and type(value) ~= "table" then
+            return value, statKey(key)
+        end
+    end
+    return nil
+end
+
+local function formatStatValue(value, field_kind, source_key)
+    local number = tonumber(value)
+    if not number then
+        return tostring(value or "")
+    end
+    if field_kind == "duration" then
+        local key = source_key or ""
+        if key:find("millisecond", 1, true)
+            or key:find("millis", 1, true) then
+            number = number / 1000
+        elseif key:find("minute", 1, true) then
+            number = number * 60
+        end
+        return formatDuration(number)
+    elseif field_kind == "days" then
+        return string.format(_("%d天"), math.floor(number + 0.5))
+    elseif field_kind == "books" then
+        return string.format(_("%d本"), math.floor(number + 0.5))
+    end
+    return tostring(value)
+end
+
+local function appendStatSection(value, title, lines)
+    local data = unwrapStats(value)
+    lines[#lines + 1] = title
+    local shown = 0
+    for _, field in ipairs(STAT_FIELDS) do
+        local raw, source_key = findStatValue(data, field.keys)
+        if raw ~= nil then
+            lines[#lines + 1] = string.format("  %s：%s", field.label,
+                formatStatValue(raw, field.kind, source_key))
+            shown = shown + 1
+        end
+    end
+    if shown == 0 then
+        lines[#lines + 1] = "  " .. _("暂无可展示的数据")
+    end
+end
+
+function WeReadDesktop:formatReadStats(weekly, overall)
+    local lines = { _("微信读书阅读统计"), "" }
+    appendStatSection(weekly, _("本周"), lines)
+    lines[#lines + 1] = ""
+    appendStatSection(overall, _("累计"), lines)
+    return table.concat(lines, "\n")
+end
+
+function WeReadDesktop:showReadStats(weekly, overall)
+    local TextViewer = require("ui/widget/textviewer")
+    self:showOverlay(TextViewer:new{
+        modal = true,
+        title = _("阅读统计"),
+        text = self:formatReadStats(weekly, overall),
+        show_menu = false,
+    })
+end
+
+function WeReadDesktop:openReadStats()
+    if not self.weread or not self.weread:isLoggedIn() then
+        self:showInfo(_("请先扫码登录微信读书"))
+        return
+    end
+    self:showBusy(_("正在加载阅读统计…"))
+    self:runOnlineTask(_("阅读统计"), function()
+        local ok, weekly, overall = pcall(function()
+            return self.weread.client:get_read_stats("weekly"),
+                self.weread.client:get_read_stats("overall")
+        end)
+        self:closeBusy()
+        if not ok or type(weekly) ~= "table" or type(overall) ~= "table" then
+            logger.warn("wereaddesktop: reading stats failed:",
+                tostring(ok and "empty_response" or weekly))
+            self:showInfo(_("阅读统计加载失败，请稍后重试。"))
+            return
+        end
+        self:showReadStats(weekly, overall)
+    end)
 end
 
 ----------------------------------------------------------------
@@ -1440,7 +2111,8 @@ function WeReadDesktop:checkPluginUpdate()
             return
         end
         local ConfirmBox = require("ui/widget/confirmbox")
-        UIManager:show(ConfirmBox:new{
+        self:showOverlay(ConfirmBox:new{
+            modal = true,
             text = text .. "\n\n" .. _("是否下载并安装？安装后需要重启 KOReader。"),
             ok_text = _("立即更新"),
             ok_callback = function()
@@ -1475,11 +2147,12 @@ end
 function WeReadDesktop:showInfo(text)
     -- "full": this often follows closeBusy() on e-ink, where a partial
     -- refresh can leave the message unpainted behind the desktop.
-    UIManager:show(InfoMessage:new{ text = text }, "full")
+    self:showOverlay(InfoMessage:new{ modal = true, text = text }, "full")
 end
 
 function WeReadDesktop:showTransientInfo(text, timeout)
-    UIManager:show(InfoMessage:new{
+    self:showOverlay(InfoMessage:new{
+        modal = true,
         text = text,
         timeout = timeout or 2,
     })
@@ -1488,11 +2161,11 @@ end
 function WeReadDesktop:showBusy(text)
     self:closeBusy()
     self.busy_message = InfoMessage:new{
+        modal = true,
         text = text,
         dismissable = false,
     }
-    UIManager:show(self.busy_message)
-    self:refreshUI()
+    self:showOverlay(self.busy_message)
 end
 
 function WeReadDesktop:closeBusy()
@@ -1511,13 +2184,23 @@ function WeReadDesktop:refreshUI()
 end
 
 function WeReadDesktop:showInputDialog(dialog)
-    UIManager:show(dialog, "full")
-    self:bringToTopOfDesktop(dialog)
+    self:showOverlay(dialog, "full")
     if dialog.onShowKeyboard then
         pcall(function()
             dialog:onShowKeyboard()
         end)
     end
+end
+
+-- Show any secondary surface above the fullscreen desktop. KOReader's window
+-- manager intentionally places non-modal widgets below a modal desktop, and
+-- a few stock widgets do not consistently request a full repaint on e-ink.
+-- Keeping this seam here makes TextViewer, InfoMessage and confirmation/input
+-- dialogs behave the same in both desktop and reader contexts.
+function WeReadDesktop:showOverlay(widget, refresh_mode)
+    UIManager:show(widget, refresh_mode or "full")
+    self:bringToTopOfDesktop(widget)
+    return widget
 end
 
 -- The desktop widget is modal, so any non-modal widget shown afterwards
@@ -1527,14 +2210,18 @@ end
 -- existing menu button's settings entry fix works.
 function WeReadDesktop:bringToTopOfDesktop(widget)
     local stack = UIManager._window_stack
-    for i, entry in ipairs(stack) do
-        if entry.widget == widget then
-            table.remove(stack, i)
-            table.insert(stack, entry)
-            break
+    if type(stack) == "table" then
+        for i, entry in ipairs(stack) do
+            if entry.widget == widget then
+                table.remove(stack, i)
+                table.insert(stack, entry)
+                break
+            end
         end
     end
-    UIManager:setDirty(widget, "full")
+    if type(UIManager.setDirty) == "function" then
+        UIManager:setDirty(widget, "full")
+    end
     self:refreshUI()
 end
 
@@ -1608,6 +2295,7 @@ function WeReadDesktop:logoutWeread()
         return
     end
     self.weread:logout()
+    self.shelf_query = nil
     self:showTransientInfo(_("已退出微信读书登录"), 2)
     self:refreshDesktop()
 end
@@ -1656,7 +2344,7 @@ function WeReadDesktop:confirmWereadDownload(book, chapters)
             },
         },
     }
-    UIManager:show(dialog, "full") -- full repaint: e-ink can swallow the
+    self:showOverlay(dialog) -- full repaint: e-ink can swallow the
     -- dialog's refresh when it follows a busy-message close in the same tick
 end
 
@@ -1758,6 +2446,32 @@ function WeReadDesktop:showBookDownloadOptions(book)
             },
             {
                 {
+                    text = _("删除本地下载"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        local ConfirmBox = require("ui/widget/confirmbox")
+                        self:showOverlay(ConfirmBox:new{
+                            modal = true,
+                            text = string.format(
+                                _("确定删除《%s》的本地 EPUB、章节缓存和书友想法缓存吗？"),
+                                book.text or ""),
+                            ok_text = _("删除"),
+                            ok_callback = function()
+                                local ok, err = self.weread:deleteBook(book.book_id)
+                                if ok then
+                                    self:showTransientInfo(_("已删除本地下载"), 2)
+                                    self:refreshDesktop()
+                                else
+                                    self:showInfo(_("删除本地下载失败：") .. tostring(err))
+                                end
+                            end,
+                            cancel_text = _("取消"),
+                        })
+                    end,
+                },
+            },
+            {
+                {
                     text = _("取消"),
                     callback = function()
                         UIManager:close(dialog)
@@ -1766,7 +2480,7 @@ function WeReadDesktop:showBookDownloadOptions(book)
             },
         },
     }
-    UIManager:show(dialog, "full")
+    self:showOverlay(dialog)
 end
 
 -- Prompt a QR re-login when the web session is known to be dead (once
@@ -1929,8 +2643,7 @@ function WeReadDesktop:searchStoreBooks(keyword)
                 },
             },
         }
-        UIManager:show(dialog, "full")
-        dialog:onShowKeyboard()
+        self:showInputDialog(dialog)
         return
     end
     self:showBusy(_("正在搜索…"))
@@ -1956,17 +2669,37 @@ end
 -- stays sync.
 function WeReadDesktop:collectData()
     if self.weread and self.weread:isLoggedIn() then
-        local books = self.weread:getCachedShelf() or {}
+        local books = self:filteredShelfBooks(
+            self.weread:getCachedShelf() or {})
         for _, book in ipairs(books) do
             if not book.cover_path then
                 book.cover_path = self.weread:findCachedCover(book.book_id)
             end
+        end
+        local storage_summary
+        local ok_storage, result = pcall(
+            self.weread.getStorageSummary, self.weread)
+        if ok_storage then
+            storage_summary = result
+        end
+        local pending_summary
+        local ok_pending, pending = pcall(
+            self.weread.getPendingUploadSummary, self.weread)
+        if ok_pending then
+            pending_summary = pending
         end
         return {
             weread = true,
             account_name = self.weread:getAccountName(),
             account_vid = self.weread:getAccountVid(),
             books = books,
+            shelf_query = self.shelf_query,
+            shelf_sort_label = self:shelfSortLabel(),
+            storage_label = storage_summary and string.format(
+                _("%d 本 · %s"),
+                tonumber(storage_summary.book_count) or 0,
+                formatStorageBytes(storage_summary.bytes)) or nil,
+            sync_status_label = self:syncStatusLabel(pending_summary),
             -- Store tab state (nil until the user visits the store).
             store_feed = self.store_feed,
             store_error = self.store_error,
@@ -2093,8 +2826,9 @@ function WeReadDesktop:showDesktop()
             UIManager:broadcastEvent(Event:new("Exit"))
         end,
     })
+    local desktop_data = self:collectData()
     self.desktop_widget = BookshelfWidget:new{
-        data = self:collectData(),
+        data = desktop_data,
         actions = actions,
         on_open_book = function(book)
             -- WeRead book: open the downloaded EPUB or download it.
@@ -2117,6 +2851,9 @@ function WeReadDesktop:showDesktop()
             self.store_search = nil
             self:refreshDesktop()
         end,
+        on_shelf_search = function(current)
+            self:showShelfSearch(current)
+        end,
         on_toggle_sync = function()
             local enabled =
                 G_reader_settings:readSetting("wereaddesktop_progress_sync") ~= false
@@ -2131,6 +2868,18 @@ function WeReadDesktop:showDesktop()
         end,
         on_set_autosuspend = function()
             self:cycleAutosuspend()
+        end,
+        on_cycle_shelf_sort = function()
+            self:cycleShelfSort()
+        end,
+        on_storage = function()
+            self:showStorageManager()
+        end,
+        on_sync_status = function()
+            self:showSyncStatus()
+        end,
+        on_read_stats = function()
+            self:openReadStats()
         end,
         on_frontlight = function()
             self:showFrontlightDialog()
@@ -2190,7 +2939,7 @@ function WeReadDesktop:showDesktop()
     -- fetch (no cache) shows the busy spinner.
     if self.weread and self.weread:isLoggedIn() and self:isNetworkOnline() then
         self:runOnlineTask(_("刷新书架"), function()
-            self:refreshWereadShelf(true, {
+            self:refreshWereadShelf("background", {
                 silent = self.weread:getCachedShelf() ~= nil,
             })
         end, 0.5)

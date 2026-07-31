@@ -353,6 +353,7 @@ a hint, opening the keyword dialog on tap.
 local SearchEntry = InputContainer:extend{
     dimen = nil,
     callback = nil,
+    text = nil,
 }
 
 function SearchEntry:init()
@@ -382,7 +383,7 @@ function SearchEntry:init()
             },
             HorizontalSpan:new{ width = Screen:scaleBySize(8) },
             TextWidget:new{
-                text = _("搜索书名"),
+                text = self.text or _("搜索书名"),
                 face = Font:getFace("smallinfofont"),
                 fgcolor = Blitbuffer.COLOR_GRAY_9,
             },
@@ -475,6 +476,9 @@ data = {
   device_status = string|nil, -- battery · storage line
   has_frontlight = bool, night_mode = bool, wifi_on = bool,
   rotation_label/screensaver_label/clock_label = string,
+  shelf_query = string|nil, shelf_sort_label = string,
+  storage_label = string|nil,
+  sync_status_label = string|nil,
   plugin_version = string,
 }
 or { login_prompt = true } when not logged in.
@@ -494,9 +498,14 @@ local BookshelfWidget = InputContainer:extend{
     on_store_feed = nil, -- fetches the store home feed (first visit)
     on_store_search = nil, -- function(keyword|nil): nil prompts for input
     on_store_search_back = nil, -- clears search results, back to the feed
+    on_shelf_search = nil, -- function(keyword|nil): local shelf filter
     on_toggle_sync = nil, -- toggles the progress-sync setting
     on_toggle_autostart = nil, -- toggles the show-desktop-on-start setting
     on_set_autosuspend = nil, -- cycles the autosuspend (定时熄屏) timeout
+    on_cycle_shelf_sort = nil,
+    on_storage = nil,
+    on_sync_status = nil,
+    on_read_stats = nil,
     on_device_settings = nil, -- opens the device settings sub-page
     on_refresh_shelf = nil,
     on_relogin = nil,
@@ -789,12 +798,27 @@ function BookshelfWidget:buildWereadUI()
     add(VerticalSpan:new{ width = Screen:scaleBySize(8) })
     add(self:separator(content_w))
 
+    local search_h = Screen:scaleBySize(36)
+    add(VerticalSpan:new{ width = Screen:scaleBySize(10) })
+    add(SearchEntry:new{
+        dimen = Geom:new{ w = content_w, h = search_h },
+        text = self.data.shelf_query and string.format(
+            _("筛选：%s（点击修改）"), self.data.shelf_query)
+            or _("搜索书架"),
+        callback = function()
+            if self.on_shelf_search then
+                self.on_shelf_search(self.data.shelf_query)
+            end
+        end,
+    }, search_h)
+
     local books = self.data.books or {}
 
     if #books == 0 then
         add(self:buildEmptyState(content_w,
             screen_h - used_h - Screen:scaleBySize(32),
-            _("去菜单「微读 → 微信读书 → 刷新书架」拉取书架")))
+            self.data.shelf_query and _("没有匹配的书籍，点击上方搜索框修改筛选")
+                or _("去菜单「微读 → 微信读书 → 刷新书架」拉取书架")))
     else
         local title_h = textHeight(Font:getFace("xx_smallinfofont"))
         -- One-line title only: reading state is badged on the cover, so
@@ -1266,6 +1290,11 @@ function BookshelfWidget:buildSettingsUI()
         callback = self.on_toggle_sync,
     })
     table.insert(rows, {
+        label = _("离线阅读时长"),
+        value = self.data.sync_status_label or _("无待上报"),
+        callback = self.on_sync_status,
+    })
+    table.insert(rows, {
         label = _("自动显示桌面（启动和退出书籍时）"),
         value = self.data.auto_start and _("开") or _("关"),
         callback = self.on_toggle_autostart,
@@ -1274,6 +1303,21 @@ function BookshelfWidget:buildSettingsUI()
         label = _("定时熄屏（无操作自动休眠）"),
         value = self.data.autosuspend_label,
         callback = self.on_set_autosuspend,
+    })
+    table.insert(rows, {
+        label = _("书架排序"),
+        value = self.data.shelf_sort_label,
+        callback = self.on_cycle_shelf_sort,
+    })
+    table.insert(rows, {
+        label = _("阅读统计"),
+        value = _("查看"),
+        callback = self.on_read_stats,
+    })
+    table.insert(rows, {
+        label = _("微读缓存"),
+        value = self.data.storage_label or _("查看"),
+        callback = self.on_storage,
     })
     if self.data.has_frontlight then
         table.insert(rows, {

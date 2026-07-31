@@ -16,6 +16,7 @@ local Content = require("weread.lib.content")
 local Downloader = require("weread.lib.downloader")
 local QRLogin = require("weread.lib.qr_login")
 local Settings = require("weread.lib.settings")
+local Storage = require("weread.lib.storage")
 local WeRead = require("weread.lib.protocol")
 local logger = require("weread.lib.logger").scoped("Bridge")
 
@@ -25,6 +26,8 @@ Bridge.__index = Bridge
 local SHELF_CACHE_KEY = "wereaddesktop_shelf"
 -- Shelf cache key used before the plugin was renamed; migrated on read.
 local LEGACY_SHELF_CACHE_KEY = "kodesktop_shelf"
+local SHELF_FETCHED_AT_KEY = "wereaddesktop_shelf_fetched_at"
+local BACKGROUND_SHELF_TTL = 5 * 60
 local COVER_EXTS = { ".jpg", ".png", ".webp", ".gif" }
 
 -- Guess an image extension from the file's magic bytes.
@@ -151,8 +154,10 @@ function Bridge:logout()
     end
     self.settings:reset_account()
     self.settings:set(SHELF_CACHE_KEY, nil)
+    self.settings:set(SHELF_FETCHED_AT_KEY, nil)
     self.settings:set("pending_finish_sync", nil)
     self.settings:flush()
+    self:invalidateStorageSummary()
 end
 
 -- Books cached from the last successful fetch (usable offline), or nil.
@@ -215,12 +220,124 @@ function Bridge:updateShelfFinished(book_id, finished)
     end
 end
 
+function Bridge:getStorageSummary()
+    local now = os.time()
+    if self.storage_summary and self.storage_summary_at
+        and now - self.storage_summary_at < 10 then
+        return self.storage_summary
+    end
+    self.storage_summary = Storage.summary(
+        self.settings, self.settings:get("books", {}))
+    self.storage_summary_at = now
+    return self.storage_summary
+end
+
+function Bridge:invalidateStorageSummary()
+    self.storage_summary = nil
+    self.storage_summary_at = nil
+end
+
+-- Reuse the downloader's reference-counted KOReader + device standby guard
+-- for other long background work such as paced reading-time replay.
+function Bridge:acquireStandbyGuard()
+    self:_getDownloader():_beginStandby()
+end
+
+function Bridge:releaseStandbyGuard()
+    if self.downloader then
+        self.downloader:_endStandby()
+    end
+end
+
+function Bridge:getPendingUploadSummary()
+    local count, time_count, elapsed, replay_chunks = 0, 0, 0, 0
+    for _, book in pairs(self.settings:get("books", {})) do
+        local pending_elapsed = type(book) == "table"
+            and (math.max(0, tonumber(book.pending_upload_elapsed) or 0)
+                + math.max(0, tonumber(book.pending_replay_elapsed) or 0)) or 0
+        if type(book) == "table"
+            and (type(book.pending_upload_position) == "table"
+                or pending_elapsed > 0) then
+            count = count + 1
+            elapsed = elapsed + pending_elapsed
+            if pending_elapsed > 0 then
+                time_count = time_count + 1
+                replay_chunks = replay_chunks + math.ceil(pending_elapsed / 60)
+            end
+        end
+    end
+    return {
+        count = count,
+        time_count = time_count,
+        elapsed = elapsed,
+        replay_chunks = replay_chunks,
+    }
+end
+
+-- Discard only queued reading-time deltas. Keep the pending position so the
+-- next automatic reconnect can still sync the user's latest reading place.
+function Bridge:clearPendingUploadElapsed()
+    local books = self.settings:get("books", {})
+    local count, elapsed = 0, 0
+    for _, book in pairs(type(books) == "table" and books or {}) do
+        local pending_elapsed = type(book) == "table"
+            and (math.max(0, tonumber(book.pending_upload_elapsed) or 0)
+                + math.max(0, tonumber(book.pending_replay_elapsed) or 0)) or 0
+        if pending_elapsed > 0 then
+            count = count + 1
+            elapsed = elapsed + pending_elapsed
+            book.pending_upload_elapsed = nil
+            book.pending_upload_started_at = nil
+            book.pending_replay_elapsed = nil
+            book.pending_replay_started_at = nil
+            book.pending_upload_updated_at = os.time()
+        end
+    end
+    if count > 0 then
+        self.settings:set("books", books)
+        self.settings:flush()
+    end
+    return count, elapsed
+end
+
+-- Remove only the dedicated per-book cache directory, then remove its index
+-- record. The confirmation dialog lives in main.lua; this method is the
+-- storage seam used by both the desktop and future maintenance tools.
+function Bridge:deleteBook(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return false, "empty_book_id"
+    end
+    local books = self.settings:get("books", {})
+    local book = books[book_id]
+    if type(book) ~= "table" then
+        return false, "book_not_found"
+    end
+    local ok, err = Storage.remove_book(self.settings, book_id, book)
+    if not ok then
+        return false, err or "remove_cache_failed"
+    end
+    books[book_id] = nil
+    self.settings:set("books", books)
+    self.settings:flush()
+    self:invalidateStorageSummary()
+    return true
+end
+
 -- Fetch the shelf via the gateway and update the cache. Synchronous and
 -- blocking; cb(books|nil, err). Without force_refresh a cached shelf is
 -- returned straight away.
 function Bridge:fetchShelf(force_refresh, cb)
+    local cached = self:getCachedShelf()
+    if force_refresh == "background" and cached then
+        local fetched_at = tonumber(self.settings:get(
+            SHELF_FETCHED_AT_KEY, 0)) or 0
+        if fetched_at > 0 and os.time() - fetched_at < BACKGROUND_SHELF_TTL then
+            cb(cached)
+            return
+        end
+    end
     if not force_refresh then
-        local cached = self:getCachedShelf()
         if cached then
             cb(cached)
             return
@@ -303,6 +420,7 @@ function Bridge:fetchShelf(force_refresh, cb)
             > (b2.last_read_time or b2.read_update_time or 0)
     end)
     self.settings:set(SHELF_CACHE_KEY, books)
+    self.settings:set(SHELF_FETCHED_AT_KEY, os.time())
     self.settings:flush()
     cb(books)
 end
@@ -540,6 +658,12 @@ function Bridge:_getDownloader()
         refresh_ui = function()
             self.host:refreshUI()
         end,
+        show_overlay = function(widget, refresh_mode)
+            if self.host.showOverlay then
+                return self.host:showOverlay(widget, refresh_mode)
+            end
+            return nil
+        end,
         -- The desktop has no per-book download indicators; a plain data
         -- refresh is enough.
         refresh_shelf = function()
@@ -642,6 +766,7 @@ function Bridge:downloadBook(shelf_book, chapters, cb, opts)
         open_on_complete = opts.open_on_complete ~= false,
         on_complete = function(ok, value)
             if ok then
+                self:invalidateStorageSummary()
                 self._download_err = nil
                 if cb then
                     pcall(cb, value)

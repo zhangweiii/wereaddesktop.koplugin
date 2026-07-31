@@ -96,8 +96,7 @@ local reports = {}
 local orig_report_read = client.report_read
 client.report_read = function(self, payload, referer)
     local result = orig_report_read(self, payload, referer)
-    local accepted = WeRead.is_success_response(result)
-        or (type(result) == "table" and result.synckey ~= nil)
+    local accepted = type(result) == "table" and result.synckey ~= nil
     local entry = {
         wall = os.time(),
         rt = payload.rt, ts = payload.ts, ct = payload.ct,

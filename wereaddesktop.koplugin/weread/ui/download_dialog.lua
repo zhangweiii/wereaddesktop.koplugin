@@ -103,8 +103,12 @@ function DownloadDialog:setTitle(title)
     end
 end
 
-function DownloadDialog:show()
-    UIManager:show(self, "ui")
+function DownloadDialog:show(show_overlay)
+    if type(show_overlay) == "function" then
+        show_overlay(self, "ui")
+    else
+        UIManager:show(self, "ui")
+    end
 end
 
 function DownloadDialog:close()

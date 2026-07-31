@@ -72,6 +72,7 @@ Downloader.__index = Downloader
 -- o = {
 --   client, settings,                       -- injected dependencies
 --   show_info(text), show_transient(text, timeout),
+--   show_overlay(widget, refresh_mode),
 --   refresh_ui(), refresh_shelf(),
 --   open_file(path), safe_callback(label, fn),
 --   require_login(cookie, api_key), run_online_task(label, fn),  -- host framework
@@ -80,6 +81,17 @@ function Downloader:new(o)
     o = o or {}
     setmetatable(o, self)
     return o
+end
+
+function Downloader:_showOverlay(widget, refresh_mode)
+    if type(self.show_overlay) == "function" then
+        local shown = self.show_overlay(widget, refresh_mode)
+        if shown then
+            return shown
+        end
+    end
+    UIManager:show(widget, refresh_mode or "full")
+    return widget
 end
 
 -- Keep the device awake during long book downloads (reference counted so
@@ -220,7 +232,7 @@ function Downloader:start(book, chapters, suffix, options)
             }},
         }
         dl.progress_dialog = progress_dialog
-        progress_dialog:show()
+        progress_dialog:show(self.show_overlay)
         self.refresh_ui()
 
         self:_scheduleGuarded(dl, function() self:_step(dl) end)
@@ -444,7 +456,7 @@ function Downloader:_showIncompleteDialog(dl, path, completion_text)
             },
         },
     }
-    UIManager:show(dialog, "full")
+    self:_showOverlay(dialog)
 end
 
 function Downloader:_step(dl)
@@ -567,7 +579,8 @@ function Downloader:_step(dl)
             self:_showIncompleteDialog(dl, path, completion_text)
             return
         end
-        UIManager:show(ConfirmBox:new{
+        self:_showOverlay(ConfirmBox:new{
+            modal = true,
             text = completion_text,
             ok_text = _("Read now"),
             ok_callback = self.safe_callback(_("Read now"), function()
