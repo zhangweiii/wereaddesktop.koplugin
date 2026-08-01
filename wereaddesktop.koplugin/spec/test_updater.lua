@@ -60,25 +60,25 @@ package.preload["libs/libkoreader-lfs"] = function()
 end
 
 local downloaded
+local archive_entries = {
+    {
+        path = "wereaddesktop.koplugin/",
+        mode = "directory",
+    },
+    {
+        path = "wereaddesktop.koplugin/main.lua",
+        mode = "file",
+    },
+    {
+        path = "wereaddesktop.koplugin/_meta.lua",
+        mode = "file",
+    },
+    {
+        path = "wereaddesktop.koplugin/wereaddesktop_version.lua",
+        mode = "file",
+    },
+}
 package.preload["ffi/archiver"] = function()
-    local entries = {
-        {
-            path = "wereaddesktop.koplugin/",
-            mode = "directory",
-        },
-        {
-            path = "wereaddesktop.koplugin/main.lua",
-            mode = "file",
-        },
-        {
-            path = "wereaddesktop.koplugin/_meta.lua",
-            mode = "file",
-        },
-        {
-            path = "wereaddesktop.koplugin/wereaddesktop_version.lua",
-            mode = "file",
-        },
-    }
     return {
         Reader = {
             new = function()
@@ -94,7 +94,7 @@ package.preload["ffi/archiver"] = function()
                         local index = 0
                         return function()
                             index = index + 1
-                            return entries[index]
+                            return archive_entries[index]
                         end
                     end,
                     extractToPath = function(_self, archive_path, destination)
@@ -255,6 +255,77 @@ do
         call_ok and installed == true and install_err == nil)
     check("install writes only the final response body",
         downloaded == payload)
+    os.execute("rm -rf " .. string.format("%q", tmp_root))
+end
+
+----------------------------------------------------------------
+-- install layout validation: any entry outside the plugin root must
+-- be rejected, including AppleDouble metadata (._*), stray files and
+-- parent-directory references.
+----------------------------------------------------------------
+do
+    local tmp_root = (os.getenv("TMPDIR") or "/tmp")
+        .. "/wereaddesktop_updater_layout_" .. tostring(os.time())
+        .. "_" .. tostring(math.random(100000))
+    os.execute("mkdir -p " .. string.format("%q", tmp_root .. "/plugins"))
+
+    local function run_install_with(entries)
+        archive_entries = entries
+        local client = {
+            request_follow = function(_self, opts)
+                opts.sink("fake-tarball-payload")
+                opts.sink(nil)
+                return nil, 200
+            end,
+        }
+        local call_ok, installed, install_err = pcall(
+            Updater.install, client, "https://github.test/asset.tar.gz",
+            tmp_root .. "/plugins", tmp_root)
+        return call_ok, installed, install_err
+    end
+
+    local function valid_entries()
+        return {
+            { path = "wereaddesktop.koplugin/", mode = "directory" },
+            { path = "wereaddesktop.koplugin/main.lua", mode = "file" },
+            { path = "wereaddesktop.koplugin/_meta.lua", mode = "file" },
+            { path = "wereaddesktop.koplugin/wereaddesktop_version.lua",
+                mode = "file" },
+        }
+    end
+
+    local ok, installed, err = run_install_with({
+        { path = "._wereaddesktop.koplugin", mode = "directory" },
+    })
+    check("top-level AppleDouble entry -> bad_tarball_layout",
+        ok and err == "bad_tarball_layout")
+
+    ok, installed, err = run_install_with({
+        { path = "wereaddesktop.koplugin/", mode = "directory" },
+        { path = "evil.txt", mode = "file" },
+    })
+    check("entry outside plugin root -> bad_tarball_layout",
+        ok and err == "bad_tarball_layout")
+
+    ok, installed, err = run_install_with({
+        { path = "wereaddesktop.koplugin/", mode = "directory" },
+        { path = "wereaddesktop.koplugin/../evil.txt", mode = "file" },
+    })
+    check("parent-directory reference -> bad_tarball_layout",
+        ok and err == "bad_tarball_layout")
+
+    ok, installed, err = run_install_with({
+        { path = "wereaddesktop.koplugin/", mode = "directory" },
+        { path = "wereaddesktop.koplugin/main.lua", mode = "file" },
+        { path = "wereaddesktop.koplugin/_meta.lua", mode = "file" },
+        { path = "wereaddesktop.koplugin/wereaddesktop_version.lua",
+            mode = "file" },
+        { path = "wereaddesktop.koplugin/._main.lua", mode = "file" },
+    })
+    check("nested AppleDouble entry passes layout (libarchive hides it at read time)",
+        ok and installed == true and err == nil)
+
+    archive_entries = valid_entries()
     os.execute("rm -rf " .. string.format("%q", tmp_root))
 end
 

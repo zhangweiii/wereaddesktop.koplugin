@@ -78,6 +78,7 @@ local function make_settings(books)
     return {
         data = { books = books },
         cache_dir = "/cache",
+        saves = 0,
         flushes = 0,
         get = function(self, key, default)
             local value = self.data[key]
@@ -86,6 +87,26 @@ local function make_settings(books)
         end,
         set = function(self, key, value) self.data[key] = value end,
         flush = function(self) self.flushes = self.flushes + 1 end,
+        get_book = function(self, book_id)
+            local shelf = self.data.books or {}
+            return shelf[tostring(book_id)]
+        end,
+        save_book = function(self, book_id, book)
+            self.saves = self.saves + 1
+            local shelf = self.data.books or {}
+            shelf[tostring(book_id)] = book
+            self.data.books = shelf
+            return true
+        end,
+        remove_book = function(self, book_id)
+            local shelf = self.data.books or {}
+            if shelf[tostring(book_id)] == nil then
+                return false
+            end
+            shelf[tostring(book_id)] = nil
+            self.data.books = shelf
+            return true
+        end,
     }
 end
 
@@ -179,6 +200,20 @@ do
         client.calls[2] and client.calls[2].progress == 50)
     check("successful upload persists the position", settings.flushes > 0
         and tonumber(settings.data.books["12345"].progress) == 50)
+end
+
+-- A successful heartbeat persists the pre-send pending state and the final
+-- uploaded state, without an extra clear pass for the same book.
+do
+    local uploader, settings = make_uploader()
+    uploader:onReaderReady(BOOK_PATH)
+    local saves_before = settings.saves
+    local flushes_before = settings.flushes
+    clock.t = clock.t + 30
+    tick(uploader)
+    check("heartbeat coalesces the post-upload book persistence",
+        settings.saves - saves_before == 2
+        and settings.flushes - flushes_before == 2)
 end
 
 -- Non-WeRead path: no detection, no report.

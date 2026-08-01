@@ -23,15 +23,16 @@ package.preload["weread.lib.reader_state"] = function() return {} end
 package.preload["libs/libkoreader-lfs"] = function()
     return {
         attributes = function(path, key)
+            local is_dir = os.execute("test -d " .. string.format("%q", path))
+            if is_dir == true or is_dir == 0 then
+                if key == "mode" then return "directory" end
+                return { mode = "directory" }
+            end
             local f = io.open(path, "rb")
             if f then
                 f:close()
                 if key == "mode" then return "file" end
                 return { mode = "file" }
-            end
-            local ok = os.execute("test -d " .. string.format("%q", path))
-            if (ok == true or ok == 0) and key == "mode" then
-                return "directory"
             end
             return nil
         end,
@@ -49,6 +50,10 @@ package.preload["libs/libkoreader-lfs"] = function()
                 i = i + 1
                 return entries[i]
             end
+        end,
+        mkdir = function(path)
+            local ok = os.execute("mkdir -p " .. string.format("%q", path))
+            return (ok == true or ok == 0) or nil
         end,
     }
 end

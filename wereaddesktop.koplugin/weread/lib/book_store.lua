@@ -3,6 +3,8 @@ if not ok_json then
     ok_json, json = pcall(require, "rapidjson")
 end
 
+local Content = require("weread.lib.content")
+
 local BookStore = {}
 
 local reading_fields = {
@@ -134,7 +136,10 @@ end
 function BookStore.save(settings, book_id, book)
     book = type(book) == "table" and book or {}
     local dir = resolved_dir(settings, book_id, book)
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    local made, mkdir_err = Content.ensure_dir_tree(dir)
+    if not made then
+        return false, mkdir_err or "mkdir failed"
+    end
 
     local metadata = { book_id = book.book_id or book.bookId or tostring(book_id) }
     local reading_state = {}

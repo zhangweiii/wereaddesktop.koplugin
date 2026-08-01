@@ -42,7 +42,7 @@
 
 ## 安装
 
-1. 安装 [KOReader](https://github.com/koreader/koreader)（已在 2026.07 版本测试；插件使用了 `UIManager._window_stack` 内部接口修正菜单层级，过旧版本可能不兼容）。
+1. 安装 [KOReader](https://github.com/koreader/koreader)（仅在 2026.07 版本验证过；插件依赖若干 KOReader 内部接口，见下文「KOReader 兼容性」，过旧或过新的版本可能不兼容）。
 2. 把 `wereaddesktop.koplugin` 目录复制到 KOReader 的 `plugins/` 目录下。
 3. 重启 KOReader，首次启动会弹出微信读书扫码登录。
 
@@ -95,6 +95,9 @@ luajit spec/test_storage.lua
 luajit spec/test_publisher_footnotes.lua
 luajit spec/test_updater.lua
 luajit spec/test_wifi_state.lua
+luajit spec/test_single_book_store.lua
+luajit spec/test_epub_write.lua
+luajit spec/test_client_redirects.lua
 ```
 
 跨实例设置合并测试还需要一个 KOReader 源码 checkout 提供 `luasettings` 等前端模块：
@@ -128,6 +131,24 @@ PLUGIN_DIR=/absolute/path/to/wereaddesktop.koplugin
 2. 运行 `sh tools/release.sh` 生成 `dist/wereaddesktop.koplugin-v<版本>.tar.gz`。
 3. 提交版本号后，在 GitHub 上推送 `v<版本>` 标签：`release.yml` 会自动构建 tar.gz 并创建 Release（插件的「检查更新」只认 `.tar.gz` 附件，且压缩包根目录必须是 `wereaddesktop.koplugin/`）。
 4. 发布仓库已配置在 `wereaddesktop.koplugin/updater.lua` 的 `GITHUB_REPO` 常量（当前为 `zhangweiii/wereaddesktop.koplugin`）；如需临时指向其它仓库（测试 fork），可通过 KOReader 设置 `wereaddesktop_update_repo` 覆盖。
+
+## 安全与信任边界
+
+- **凭据存储**：登录后的 `api_key`、cookies（含访问令牌）保存在 KOReader 的 `settings/weread.lua` 中，是设备本地的明文文件。设备本身的安全性（文件权限、备份、是否多人共用）决定这些凭据的安全边界。
+- **自更新信任模型**：「检查更新」从 GitHub Releases 下载插件压缩包并安装，只校验压缩包布局（所有条目必须在 `wereaddesktop.koplugin/` 内）和必要文件，不校验发布者签名或哈希。信任链取决于默认发布仓库（`zhangweiii/wereaddesktop.koplugin`）的账号与构建链安全；通过 `wereaddesktop_update_repo` 指向其他仓库，等于主动信任该仓库。若发布链被攻破，更新包可以携带任意代码。
+- 建议只从可信来源安装插件，并留意 GitHub 发布页与仓库动态。
+
+## KOReader 兼容性
+
+插件仅在 2026.07 的 KOReader 版本上验证。它使用以下内部或半公开接口，升级 KOReader 时应重点回归：
+
+- `UIManager._window_stack`：桌面层级修正（菜单、前光、输入框等置顶）
+- `ReaderUI.showFileManager`：退出书籍后桌面立即显示，避免文件列表闪现
+- `ReaderStatus.markBook`：读完弹窗状态同步到微信读书云端
+- `ffi/archiver`：EPUB 打包与自更新解压
+- `lua-ljsqlite3`：书友想法缓存
+
+这些接口未在其它 KOReader 版本上验证；请勿据此断言插件支持任意版本。
 
 ## 许可证与致谢
 

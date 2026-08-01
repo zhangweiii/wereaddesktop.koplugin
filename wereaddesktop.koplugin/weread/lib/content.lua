@@ -8,6 +8,46 @@ local Content = {}
 
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
+-- Recursive mkdir without a shell: lfs.mkdir only creates one level, while
+-- the old `os.execute("mkdir -p ...")` relied on shell quoting that would
+-- still expand $()/backticks inside double-quoted %q paths. Handles
+-- absolute and relative paths; returns true or nil + error string.
+function Content.ensure_dir_tree(path)
+    if type(path) ~= "string" or path == "" then
+        return nil, "empty path"
+    end
+    path = path:gsub("/+$", "")
+    if path == "" or path == "/" then
+        return true
+    end
+    local prefix = path:sub(1, 1) == "/" and "/" or ""
+    local current = prefix
+    local ok, err = pcall(function()
+        for part in path:gmatch("[^/]+") do
+            current = current == prefix and (prefix .. part)
+                or (current .. "/" .. part)
+            local mode = lfs.attributes(current, "mode")
+            if mode == nil then
+                local made, mkdir_err = lfs.mkdir(current)
+                if not made then
+                    error(mkdir_err or ("mkdir failed: " .. current))
+                end
+            elseif mode ~= "directory" and mode ~= "link" then
+                -- lfs.attributes reports lstat: a symlink to a directory
+                -- (e.g. /var -> /private/var on macOS) shows up as "link".
+                -- Let it pass; a link to a non-directory still fails in
+                -- mkdir/io.open below.
+                error("not a directory: " .. current)
+            end
+        end
+    end)
+    if not ok then
+        logger.warn("ensure_dir_tree failed:", path, tostring(err))
+        return nil, tostring(err)
+    end
+    return true
+end
+
 local function basename_safe(value)
     value = tostring(value or ""):gsub("[^%w%._-]", "_")
     if value == "" then
@@ -72,7 +112,10 @@ function Content.save_catalog_cache(client, settings, book, chapters)
         return false, "missing book id"
     end
     local dir = path:match("^(.*)/[^/]+$")
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    local made, mkdir_err = Content.ensure_dir_tree(dir)
+    if not made then
+        return false, mkdir_err or "mkdir failed"
+    end
     local ok, encoded = pcall(function()
         return client:json_encode({
             version = 1,
@@ -178,7 +221,10 @@ function Content.chapter_parts_dir(settings, book)
 end
 
 local function write_file(path, data)
-    os.execute("mkdir -p " .. string.format("%q", path:match("^(.*)/[^/]+$")))
+    local made = Content.ensure_dir_tree(path:match("^(.*)/[^/]+$"))
+    if not made then
+        return false
+    end
     local file = io.open(path, "wb")
     if not file then
         return false
@@ -342,14 +388,30 @@ end
 
 local function write_epub(path, entries)
     local Archiver = require("ffi/archiver")
+    local tmp_path = path .. ".tmp"
     local archive = Archiver.Writer:new{}
-    if not archive:open(path, "epub") then
+    if not archive:open(tmp_path, "epub") then
+        os.remove(tmp_path)
         error("failed to open archive for writing: " .. tostring(archive.err))
     end
 
-    local mtime = os.time()
+    -- Archive operations report failure through .err; a failed EPUB must
+    -- never replace an existing file.
+    local function fail(label, err)
+        archive:close()
+        os.remove(tmp_path)
+        error(label .. ": " .. tostring(err))
+    end
 
+    local function check_archive_error(label)
+        if archive.err then
+            fail(label, archive.err)
+        end
+    end
+
+    local mtime = os.time()
     archive:setZipCompression("store")
+    check_archive_error("failed to set zip compression")
     local mimetype_data = "application/epub+zip"
     for _, entry in ipairs(entries) do
         if entry.name == "mimetype" then
@@ -357,16 +419,40 @@ local function write_epub(path, entries)
             break
         end
     end
-    archive:addFileFromMemory("mimetype", mimetype_data, mtime)
+    if not archive:addFileFromMemory("mimetype", mimetype_data, mtime) then
+        fail("failed to write mimetype", archive.err)
+    end
 
     archive:setZipCompression("deflate")
+    check_archive_error("failed to set zip compression")
     for _, entry in ipairs(entries) do
         if entry.name ~= "mimetype" then
-            archive:addFileFromMemory(entry.name, entry.data or "", mtime)
+            if not archive:addFileFromMemory(
+                entry.name, entry.data or "", mtime) then
+                fail("failed to write " .. entry.name, archive.err)
+            end
         end
     end
 
     archive:close()
+    if archive.err then
+        local archive_err = archive.err
+        os.remove(tmp_path)
+        error("failed to finalize archive: " .. tostring(archive_err))
+    end
+    -- Writer:close() swallows libarchive's finalization status, so verify
+    -- the staged file was actually produced before atomically replacing
+    -- the previous EPUB.
+    local size = lfs.attributes(tmp_path, "size")
+    if not size or size <= 0 then
+        os.remove(tmp_path)
+        error("failed to finalize archive")
+    end
+    local renamed, rename_err = os.rename(tmp_path, path)
+    if not renamed then
+        os.remove(tmp_path)
+        error("failed to move archive into place: " .. tostring(rename_err))
+    end
 end
 
 local function xml_escape(value)
@@ -710,7 +796,10 @@ end
 function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    local made, mkdir_err = Content.ensure_dir_tree(dir)
+    if not made then
+        error("cannot create book directory: " .. tostring(mkdir_err))
+    end
     book.cache_dir = dir
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
@@ -782,7 +871,10 @@ end
 function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    local made, mkdir_err = Content.ensure_dir_tree(dir)
+    if not made then
+        error("cannot create book directory: " .. tostring(mkdir_err))
+    end
     book.cache_dir = dir
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"

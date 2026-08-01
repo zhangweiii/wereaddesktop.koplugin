@@ -43,7 +43,10 @@ jobs:
             spec/test_storage.lua \
             spec/test_publisher_footnotes.lua \
             spec/test_updater.lua \
-            spec/test_wifi_state.lua; do
+            spec/test_wifi_state.lua \
+            spec/test_single_book_store.lua \
+            spec/test_epub_write.lua \
+            spec/test_client_redirects.lua; do
             echo "== $test =="
             luajit "$test"
           done

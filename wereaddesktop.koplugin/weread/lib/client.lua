@@ -172,7 +172,11 @@ end
 local function clear_cross_origin_headers(headers)
     for key in pairs(headers or {}) do
         local name = tostring(key):lower()
-        if name == "authorization" or name == "cookie" or name == "origin" then
+        -- Referer is deliberately dropped too: chapter resource requests
+        -- carry a full WeRead reader URL (book/chapter ids) that must not
+        -- leak to a third-party redirect target.
+        if name == "authorization" or name == "cookie"
+            or name == "origin" or name == "referer" then
             headers[key] = nil
         end
     end

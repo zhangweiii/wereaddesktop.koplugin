@@ -178,6 +178,71 @@ function Settings:get(key, default)
     return books
 end
 
+-- Load a single book record without scanning (and file-loading) the whole
+-- shelf. The per-book files are still read; the in-file books index is only
+-- a book_id -> { cache_dir } map, so this costs 2 file reads instead of 2N.
+function Settings:get_book(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return nil
+    end
+    local indexes = self.store:readSetting("books", {})
+    local index = type(indexes) == "table" and indexes[book_id] or nil
+    if type(index) ~= "table" then
+        -- Another context (file manager vs reader) may have written the
+        -- index after this instance loaded its snapshot.
+        self:refresh("books")
+        indexes = self.store:readSetting("books", {})
+        index = type(indexes) == "table" and indexes[book_id] or nil
+    end
+    if type(index) ~= "table" then
+        return nil
+    end
+    return BookStore.load(self, book_id, index)
+end
+
+-- Save one book record (its per-book files plus the books index entry)
+-- without rewriting every other book's files. The in-file index merge on
+-- flush() still uses the dirty/removed sets, so concurrent contexts keep
+-- their own book entries.
+function Settings:save_book(book_id, book)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        error("save_book: empty book_id")
+    end
+    local ok, index_or_err = BookStore.save(self, book_id, book)
+    if not ok then
+        error("Could not save book data: " .. tostring(index_or_err))
+    end
+    local indexes = self.store:readSetting("books", {})
+    if type(indexes) ~= "table" then
+        indexes = {}
+    end
+    indexes[book_id] = index_or_err
+    self:_set_dirty("books", indexes)
+    self._dirty_books[book_id] = true
+    self._removed_books[book_id] = nil
+    return true
+end
+
+-- Drop one book's index entry without touching any other book. The caller
+-- is responsible for removing the book's cache files.
+function Settings:remove_book(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return false
+    end
+    local indexes = self.store:readSetting("books", {})
+    if type(indexes) ~= "table" or indexes[book_id] == nil then
+        return false
+    end
+    indexes[book_id] = nil
+    self:_set_dirty("books", indexes)
+    self._removed_books[book_id] = true
+    self._dirty_books[book_id] = nil
+    return true
+end
+
 -- Record a top-level write through this instance. flush() only writes
 -- back keys recorded here; everything else keeps the on-disk value, so
 -- two live instances (file manager + reader contexts, or the weread

@@ -1350,7 +1350,7 @@ function WeReadDesktop:startPendingReadingTimeUpload()
             end,
             on_finished = function()
                 local ok, err = xpcall(function()
-                    local current = bridge.settings:get("books", {})[book_id]
+                    local current = bridge.settings:get_book(book_id)
                     if type(current) == "table"
                         and (tonumber(current.pending_replay_elapsed) or 0) > 0 then
                         finish(_("离线阅读时长上报已暂停，可稍后继续"))

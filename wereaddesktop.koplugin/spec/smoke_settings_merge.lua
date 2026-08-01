@@ -33,6 +33,13 @@ end
 package.preload["libs/libkoreader-lfs"] = function()
     return {
         attributes = function(path, key)
+            local ok_dir = os.execute("test -d " .. string.format("%q", path))
+            local is_dir = ok_dir == true or ok_dir == 0
+            if is_dir then
+                if key == "mode" then return "directory" end
+                if key == "modification" then return os.time() end
+                return { mode = "directory", modification = os.time() }
+            end
             local f = io.open(path, "rb")
             if f then
                 f:close()
@@ -40,17 +47,11 @@ package.preload["libs/libkoreader-lfs"] = function()
                 if key == "modification" then return os.time() end
                 return { mode = "file", modification = os.time() }
             end
-            local ok = os.execute("test -d " .. string.format("%q", path))
-            local is_dir = ok == true or ok == 0
-            if is_dir then
-                if key == "mode" then return "directory" end
-                if key == "modification" then return os.time() end
-                return { mode = "directory", modification = os.time() }
-            end
             return nil
         end,
         mkdir = function(path)
-            os.execute("mkdir -p " .. string.format("%q", path))
+            local ok = os.execute("mkdir -p " .. string.format("%q", path))
+            return ok == true or ok == 0
         end,
     }
 end

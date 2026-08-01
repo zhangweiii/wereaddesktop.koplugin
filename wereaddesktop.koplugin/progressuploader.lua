@@ -127,12 +127,11 @@ local function response_summary(result)
     return #parts > 0 and table.concat(parts, ",") or "table_without_status"
 end
 
--- Persist one mutated book record (books are stored per-book via
--- BookStore, so the whole table has to round-trip through settings).
+-- Persist one mutated book record. Books live in per-book BookStore files
+-- (metadata.json + reading_state.json); the single-book path avoids
+-- reloading and rewriting every other book on every heartbeat.
 local function persist_book(settings, book)
-    local books = settings:get("books", {})
-    books[tostring(book.book_id)] = book
-    settings:set("books", books)
+    settings:save_book(tostring(book.book_id), book)
     settings:flush()
 end
 
@@ -426,7 +425,7 @@ function ProgressUploader:_onTimeReplayFinishing()
         "reading_during_manual_replay",
             self:_unreportedElapsed(), true)
     local fields = self:_timeFields()
-    local book = self.settings:get("books", {})[tostring(self.book_id)]
+    local book = self.settings:get_book(self.book_id)
     self.pending_elapsed = type(book) == "table"
         and math.max(0, tonumber(book[fields.elapsed]) or 0) or 0
     self.pending_started_at = type(book) == "table"
@@ -455,8 +454,7 @@ function ProgressUploader:_persistPending(position, reason, elapsed, force)
         and now - self.last_pending_persist_at < 5 then
         return false
     end
-    local books = self.settings:get("books", {})
-    local book = books[tostring(self.book_id)]
+    local book = self.settings:get_book(self.book_id)
     if type(book) ~= "table" then
         return false
     end
@@ -503,8 +501,7 @@ function ProgressUploader:_clearPending()
     if not self.book_id then
         return false
     end
-    local books = self.settings:get("books", {})
-    local book = books[tostring(self.book_id)]
+    local book = self.settings:get_book(self.book_id)
     if type(book) ~= "table" then
         return false
     end
@@ -533,8 +530,7 @@ function ProgressUploader:_restorePending()
     if not self.book_id then
         return false
     end
-    local books = self.settings:get("books", {})
-    local book = books[tostring(self.book_id)]
+    local book = self.settings:get_book(self.book_id)
     if type(book) ~= "table"
         or type(book.pending_upload_position) ~= "table" then
         return false
@@ -685,7 +681,7 @@ function ProgressUploader:retryPending(book_id, options)
             or false
     end
     book_id = tostring(book_id or "")
-    local book = self.settings:get("books", {})[book_id]
+    local book = self.settings:get_book(book_id)
     if book_id == "" or type(book) ~= "table"
         or type(book.pending_upload_position) ~= "table" then
         return false
@@ -920,7 +916,7 @@ function ProgressUploader:_ensureContext()
     if not self.book_id then
         return false
     end
-    local book = self.settings:get("books", {})[self.book_id]
+    local book = self.settings:get_book(self.book_id)
     if type(book) ~= "table" then
         return false
     end
@@ -1192,8 +1188,7 @@ function ProgressUploader:_upload(position, reason, attempt, options)
         -- A live reader may have advanced the book while this worker waited
         -- for the next 61-second slot. Carry its newest position instead of
         -- repeatedly pushing the stale position captured at replay start.
-        local latest_book = self.settings:get("books", {})[
-            tostring(self.book_id)]
+        local latest_book = self.settings:get_book(self.book_id)
         if type(latest_book) == "table"
             and type(latest_book.pending_upload_position) == "table" then
             position = copy_position(latest_book.pending_upload_position)
@@ -1315,31 +1310,39 @@ function ProgressUploader:_upload(position, reason, attempt, options)
                 "percent=", tostring(position.percent), "reason=", reason,
                 "attempt=", tostring(attempt), "rt=", tostring(elapsed),
                 "reported_total_s=", tostring(self.last_reported_rt))
-            self:_persist(position)
+            local final_position = self.close_position or position
+            local position_pending = self.closing and final_position
+                and not PositionMapper.same_position(final_position, position)
+            local remaining_unreported = self:_unreportedElapsed()
+            local time_pending = remaining_unreported > 0
+            local pending_position
+            local pending_reason
+            if self.closing then
+                if progress_only or hold_pending_time then
+                    if position_pending or time_pending then
+                        pending_position = final_position
+                        pending_reason = "offline_time_pending"
+                    end
+                elseif position_pending or time_pending then
+                    pending_position = final_position
+                    pending_reason = "document_close"
+                end
+            elseif time_pending then
+                pending_position = self.pending_position or position
+                pending_reason = self.pending_reason or reason
+            end
+            self:_persistUploadResult(position, pending_position,
+                pending_reason, remaining_unreported)
             if self.on_uploaded then
                 pcall(self.on_uploaded, position.book_id, position)
             end
             if self.closing then
-                local final_position = self.close_position or position
-                local position_pending = final_position
-                    and not PositionMapper.same_position(final_position, position)
-                local time_pending = self:_unreportedElapsed() > 0
                 if progress_only or hold_pending_time then
-                    if position_pending or time_pending then
-                        self.pending_position = copy_position(final_position)
-                        self:_persistPending(final_position,
-                            "offline_time_pending", self:_unreportedElapsed(), true)
-                    else
-                        self:_clearPending()
-                    end
                     self:_finishClose(generation)
                     return
                 end
                 if position_pending or time_pending then
-                    self.pending_position = copy_position(final_position)
                     self.dirty = position_pending == true
-                    self:_persistPending(final_position, "document_close",
-                        self:_unreportedElapsed(), true)
                     if time_pending then
                         self:_scheduleBacklogReplay(final_position, generation,
                             options)
@@ -1350,16 +1353,7 @@ function ProgressUploader:_upload(position, reason, attempt, options)
                         return
                     end
                 end
-                if not position_pending and not time_pending then
-                    self:_clearPending()
-                end
                 self:_finishClose(generation)
-            elseif self:_unreportedElapsed() <= 0 then
-                self:_clearPending()
-            else
-                self:_persistPending(self.pending_position or position,
-                    self.pending_reason or reason,
-                    self:_unreportedElapsed(), true)
             end
             return
         end
@@ -1402,12 +1396,12 @@ end
 -- and retry before giving up. Returns nil on success, error otherwise.
 function ProgressUploader:_send(position, elapsed, reason, attempt)
     local book_id = position.book_id
-    local book = self.settings:get("books", {})[tostring(book_id)]
+    local book = self.settings:get_book(book_id)
     if type(book) ~= "table" then
         return "book_record_missing"
     end
     if book.pclts == nil or book.pclts == "" or tonumber(book.pclts) == 0 then
-        -- Persist right away: _persist() later re-reads the books table,
+        -- Persist right away: post-send persistence re-reads the book record,
         -- so an in-memory-only mutation would be lost and pclts would be
         -- regenerated on every upload.
         book.pclts = WeRead.e(self.now())
@@ -1498,21 +1492,64 @@ function ProgressUploader:_send(position, elapsed, reason, attempt)
     return "server_rejected"
 end
 
--- Write the uploaded position back into the book record so later
--- reports start from it even across restarts.
-function ProgressUploader:_persist(position)
-    local books = self.settings:get("books", {})
-    local book = books[tostring(position.book_id)]
+-- Write the uploaded position and the remaining pending state together so a
+-- successful heartbeat does not save the same book twice.
+function ProgressUploader:_persistUploadResult(position, pending_position,
+    pending_reason, pending_elapsed)
+    local book = self.settings:get_book(position.book_id)
     if type(book) ~= "table" then
         return
     end
+    local now = self.now()
     book.chapter_uid = position.chapter_uid
     book.chapter_idx = tonumber(position.chapter_idx) or 0
     book.chapter_offset = tonumber(position.chapter_offset) or 0
     book.progress = tonumber(position.percent) or 0
     book.summary = position.summary or book.summary or ""
-    book.last_upload_at = self.now()
-    self.settings:set("books", books)
+    book.last_upload_at = now
+    local elapsed = math.max(0, tonumber(pending_elapsed) or 0)
+    local fields = self:_timeFields()
+    if pending_position then
+        self.pending_position = copy_position(pending_position)
+        self.pending_reason = pending_reason or self.pending_reason or "unknown"
+        book.pending_upload_position = copy_position(self.pending_position)
+        book.pending_upload_reason = self.pending_reason
+        book[fields.elapsed] = elapsed > 0 and elapsed or nil
+        if elapsed > 0 then
+            if not self.is_online() then
+                self.defer_pending_time = true
+            end
+            self.pending_started_at = tonumber(self.pending_started_at)
+                or tonumber(book[fields.started_at])
+                or math.max(0, now - elapsed)
+            book[fields.started_at] = self.pending_started_at
+        else
+            self.pending_started_at = nil
+            book[fields.started_at] = nil
+        end
+        book.pending_upload_updated_at = now
+        self.last_pending_persist_at = now
+    else
+        self.pending_position = nil
+        self.pending_started_at = nil
+        self.pending_reason = nil
+        self.pending_elapsed = 0
+        self.last_pending_persist_at = nil
+        self.defer_pending_time = false
+        book[fields.elapsed] = nil
+        book[fields.started_at] = nil
+        local remaining_elapsed = math.max(0,
+            tonumber(book.pending_upload_elapsed) or 0)
+            + math.max(0, tonumber(book.pending_replay_elapsed) or 0)
+        if remaining_elapsed <= 0 then
+            book.pending_upload_position = nil
+            book.pending_upload_reason = nil
+            book.pending_upload_updated_at = nil
+        else
+            book.pending_upload_updated_at = now
+        end
+    end
+    self.settings:save_book(tostring(position.book_id), book)
     self.settings:flush()
 end
 

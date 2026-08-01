@@ -308,8 +308,7 @@ function Bridge:deleteBook(book_id)
     if book_id == "" then
         return false, "empty_book_id"
     end
-    local books = self.settings:get("books", {})
-    local book = books[book_id]
+    local book = self.settings:get_book(book_id)
     if type(book) ~= "table" then
         return false, "book_not_found"
     end
@@ -317,8 +316,7 @@ function Bridge:deleteBook(book_id)
     if not ok then
         return false, err or "remove_cache_failed"
     end
-    books[book_id] = nil
-    self.settings:set("books", books)
+    self.settings:remove_book(book_id)
     self.settings:flush()
     self:invalidateStorageSummary()
     return true
@@ -621,8 +619,7 @@ end
 -- tokens) when the book was downloaded before.
 function Bridge:_libBook(shelf_book)
     local book_id = tostring(shelf_book.book_id)
-    local books = self.settings:get("books", {})
-    local lib_book = type(books[book_id]) == "table" and books[book_id] or {}
+    local lib_book = self.settings:get_book(book_id) or {}
     lib_book.book_id = book_id
     lib_book.title = lib_book.title or shelf_book.text
     lib_book.author = lib_book.author or shelf_book.authors
@@ -699,8 +696,7 @@ end
 
 -- Local EPUB path of a previously downloaded book, or nil.
 function Bridge:isBookDownloaded(book_id)
-    local books = self.settings:get("books", {})
-    local record = books[tostring(book_id)]
+    local record = self.settings:get_book(book_id)
     local path = type(record) == "table" and record.cached_file or nil
     if type(path) == "string" and path ~= ""
         and lfs.attributes(path, "mode") == "file" then

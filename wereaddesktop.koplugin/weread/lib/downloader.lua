@@ -516,7 +516,6 @@ function Downloader:_step(dl)
             dl.progress_dialog = nil
         end
         self:_releaseStandby(dl)
-        local books = self.settings:get("books", {})
         local book_id = dl.book.book_id or dl.book.bookId
         if book_id then
             dl.book.cached_chapters = dl.book.cached_chapters or {}
@@ -527,8 +526,7 @@ function Downloader:_step(dl)
                 dl.book.cached_file = path
             end
             dl.book.reader_url = dl.book.reader_url or WeRead.reader_url(book_id)
-            books[book_id] = dl.book
-            self.settings:set("books", books)
+            self.settings:save_book(tostring(book_id), dl.book)
             self.settings:flush()
         end
         self.refresh_shelf()

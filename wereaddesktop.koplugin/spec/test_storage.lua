@@ -43,6 +43,10 @@ package.preload["libs/libkoreader-lfs"] = function()
         local ok = os.execute("rmdir " .. string.format("%q", path))
         return ok == true or ok == 0
     end
+    function lfs.mkdir(path)
+        local ok = os.execute("mkdir -p " .. string.format("%q", path))
+        return ok == true or ok == 0
+    end
     return lfs
 end
 
