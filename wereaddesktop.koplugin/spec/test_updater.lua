@@ -192,6 +192,9 @@ check("release_channel recognizes supported tags",
     and Updater.release_channel("0.2.0-beta.1") == "beta"
     and Updater.release_channel("0.2.0-alpha.1") == "alpha"
     and Updater.release_channel("0.2.0-rc.1") == nil)
+check("normalize_version accepts an optional v-prefix",
+    Updater.normalize_version("v0.2.0-alpha.1") == "0.2.0-alpha.1"
+    and Updater.normalize_version("0.2.0-rc.1") == nil)
 G_reader_settings.store.wereaddesktop_update_channel = "unknown"
 check("unknown or missing channel defaults to stable",
     Updater.get_update_channel() == "stable")
@@ -245,6 +248,21 @@ do
         and latest.page_url == release.html_url)
     check("fetch_latest picks the .tar.gz asset",
         latest and latest.asset_url == "https://x/pkg.tar.gz")
+
+    client = make_client{
+        __raw = "{}", tag_name = "v0.1.3",
+        assets = {
+            { name = "wereaddesktop.koplugin-v0.1.3.tar.gz",
+                browser_download_url = "https://x/old.tar.gz" },
+        },
+    }
+    latest, err = Updater.fetch_version(client, "v0.1.3")
+    check("fetch_version selects an exact older release",
+        latest and latest.version == "0.1.3"
+        and latest.asset_url == "https://x/old.tar.gz")
+    check("fetch_version uses the tag endpoint",
+        client.last_url
+        == "https://api.github.com/repos/someone/koui/releases/tags/v0.1.3")
 
     -- Releases without the exact installable asset are skipped.
     client = make_client{

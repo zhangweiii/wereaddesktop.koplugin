@@ -125,6 +125,11 @@ function Updater.release_channel(version)
     return parsed.stage or "stable"
 end
 
+function Updater.normalize_version(version)
+    local parsed = parse_semver(version)
+    return parsed and parsed.version or nil
+end
+
 local function channel_is_allowed(candidate, requested)
     return CHANNEL_LIMIT[candidate] <= CHANNEL_LIMIT[requested]
 end
@@ -316,6 +321,37 @@ function Updater.fetch_latest(client, requested_channel)
         return Updater.compare(left.version, right.version) > 0
     end)
     return candidates[1]
+end
+
+function Updater.fetch_version(client, requested_version)
+    local version = Updater.normalize_version(requested_version)
+    if not version then
+        return nil, "invalid_version"
+    end
+    local repo = Updater.repo()
+    if not repo then
+        return nil, "repo_not_configured"
+    end
+    local body, code = client:request_follow{
+        url = "https://api.github.com/repos/" .. repo
+            .. "/releases/tags/v" .. version,
+        timeout = { 15, 30 },
+        diagnostic_api = "github_release_by_tag",
+    }
+    if tonumber(code) ~= 200 then
+        return nil, "http_" .. tostring(code or "error")
+    end
+    local ok, data = pcall(function()
+        return client:json_decode(body)
+    end)
+    if not ok or type(data) ~= "table" then
+        return nil, "bad_response"
+    end
+    local candidate = release_candidate(data, Updater.release_channel(version))
+    if not candidate or candidate.version ~= version then
+        return nil, "no_matching_release"
+    end
+    return candidate
 end
 
 function Updater.is_newer(latest_version)
@@ -560,7 +596,7 @@ function Updater.install(client, asset_url, plugins_dir, work_dir)
         url = asset_url,
         sink = download_sink,
         timeout = { 15, 300 },
-        diagnostic_api = "github_release_asset",
+        diagnostic_api = "plugin_update_asset",
     }
     if file then file:close() end
     if tonumber(code) ~= 200 then

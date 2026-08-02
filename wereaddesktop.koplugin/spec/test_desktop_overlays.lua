@@ -6,6 +6,7 @@ package.path = package.path .. ";./?.lua"
 
 local noop = function() end
 local stack = {}
+local restart_calls = 0
 
 package.preload["desktop"] = function() return {} end
 package.preload["ui/event"] = function()
@@ -45,8 +46,23 @@ package.preload["ui/uimanager"] = function()
         forceRePaint = noop,
         scheduleIn = function(_, _delay, fn) fn() end,
         broadcastEvent = noop,
+        askForRestart = function()
+            restart_calls = restart_calls + 1
+        end,
     }
     return manager
+end
+package.preload["updater"] = function()
+    return {
+        install = function()
+            return true
+        end,
+    }
+end
+package.preload["datastorage"] = function()
+    return {
+        getDataDir = function() return "/data" end,
+    }
 end
 package.preload["progressuploader"] = function()
     return {
@@ -195,6 +211,20 @@ check("clearing offline time requires confirmation",
     and clear_dialog.text:find("阅读进度不会被清除", 1, true) ~= nil)
 clear_dialog.ok_callback()
 check("confirmed offline-time clear reaches the bridge", cleared == true)
+
+instance:confirmAdvancedUpdate{
+    asset_url = "http://127.0.0.1/u.tar.gz",
+    source = "local",
+}
+local update_confirm = stack[#stack].widget
+check("update confirmation uses a compatible info icon",
+    update_confirm.icon == "notice-info")
+
+instance.weread = { client = {} }
+instance.path = "/plugins/wereaddesktop.koplugin"
+instance:installPluginUpdate("http://127.0.0.1/u.tar.gz", "local")
+check("local update asks KOReader to restart after install",
+    restart_calls == 1)
 
 if failures > 0 then
     print(failures .. " check(s) FAILED")

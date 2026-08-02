@@ -485,6 +485,7 @@ data = {
   storage_label = string|nil,
   sync_status_label = string|nil,
   plugin_version = string,
+  advanced_update_unlocked = bool,
 }
 or { login_prompt = true } when not logged in.
 actions = { { icon=, callback= }, ... }  -- top-right toolbar icons
@@ -514,6 +515,8 @@ local BookshelfWidget = InputContainer:extend{
     on_device_settings = nil, -- opens the device settings sub-page
     on_update_channel = nil,
     on_check_update = nil,
+    on_version_tap = nil,
+    on_advanced_update = nil,
     on_refresh_shelf = nil,
     on_relogin = nil,
     on_logout = nil,
@@ -1489,12 +1492,13 @@ end
 function BookshelfWidget:buildUpdateSettingsUI()
     local channel = self.data.update_channel_label or _("稳定版")
     local risk = self.data.update_risk_label
-    self:buildSettingsSubPage(_("更新与版本"), {
+    local rows = {
         {
             label = _("当前版本"),
             value = self.data.plugin_version
                 and ("v" .. self.data.plugin_version) or "-",
             chevron = false,
+            callback = self.on_version_tap,
         },
         {
             label = _("更新频道"), value = channel,
@@ -1507,7 +1511,15 @@ function BookshelfWidget:buildUpdateSettingsUI()
                 and ("v" .. self.data.plugin_version) or nil,
             callback = self.on_check_update,
         },
-    }, {
+    }
+    if self.data.advanced_update_unlocked then
+        table.insert(rows, {
+            label = _("高级升级"),
+            value = _("任意版本 / 本地包"),
+            callback = self.on_advanced_update,
+        })
+    end
+    self:buildSettingsSubPage(_("更新与版本"), rows, {
         description = _("更新只在你点击检查时进行，安装后需要重启 KOReader。"),
         status = risk,
     })

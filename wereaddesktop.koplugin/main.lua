@@ -29,6 +29,11 @@ local WeReadDesktop = WidgetContainer:extend{
 local SETTINGS_MIGRATION = {
     "show_on_start", "progress_sync", "debug_screenshot",
 }
+local ADVANCED_UPDATE_TAP_COUNT = 7
+local ADVANCED_UPDATE_TAP_WINDOW = 4
+local LOCAL_UPDATE_URL_SETTING = "wereaddesktop_local_update_url"
+local DEFAULT_LOCAL_UPDATE_URL = "http://192.168.1.100:8765/u.tar.gz"
+
 local function migrateSettings()
     if G_reader_settings:readSetting("wereaddesktop_migrated") then
         return
@@ -1969,8 +1974,19 @@ function WeReadDesktop:toggleWifi()
         ok_toggle, err = pcall(NetworkMgr.toggleWifiOff,
             NetworkMgr, done, true)
     elseif wifi_on and type(NetworkMgr.promptWifi) == "function" then
+        local stack = UIManager._window_stack
+        local before = type(stack) == "table" and #stack or nil
         ok_toggle, err = pcall(NetworkMgr.promptWifi,
             NetworkMgr, done, false, true)
+        if ok_toggle and before then
+            for i = before, #stack do
+                local entry = stack[i]
+                if entry and entry.widget ~= self.desktop_widget then
+                    self:bringToTopOfDesktop(entry.widget)
+                    break
+                end
+            end
+        end
     else
         ok_toggle, err = pcall(NetworkMgr.toggleWifiOn,
             NetworkMgr, done, false, true)
@@ -2114,9 +2130,12 @@ function WeReadDesktop:chooseUpdateChannel()
         local selected_channel = choice.channel
         local selected = selected_channel == current
         local choice_text = choice.text
+        if selected then
+            choice_text = choice_text .. _("（当前）")
+        end
         table.insert(buttons, {
             {
-                text = (selected and "✓ " or "") .. choice_text,
+                text = choice_text,
                 callback = function()
                     UIManager:close(dialog)
                     G_reader_settings:saveSetting(
@@ -2145,6 +2164,251 @@ function WeReadDesktop:chooseUpdateChannel()
         buttons = buttons,
     }
     self:showOverlay(dialog)
+end
+
+function WeReadDesktop:handleVersionTap()
+    local now = os.time()
+    if not self.version_tap_at
+        or now - self.version_tap_at > ADVANCED_UPDATE_TAP_WINDOW then
+        self.version_tap_count = 0
+    end
+    self.version_tap_count = (self.version_tap_count or 0) + 1
+    self.version_tap_at = now
+    if self.version_tap_count < ADVANCED_UPDATE_TAP_COUNT then
+        return
+    end
+    self.version_tap_count = 0
+    self.advanced_update_unlocked = true
+    self:refreshDesktop()
+    self:showTransientInfo(_("高级升级已解锁，本次运行有效。"), 3)
+end
+
+function WeReadDesktop:showAdvancedUpdateMenu()
+    if not self.advanced_update_unlocked then
+        return
+    end
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+    dialog = ButtonDialog:new{
+        modal = true,
+        dismissable = false,
+        title = _("高级升级"),
+        buttons = {
+            {
+                {
+                    text = _("安装局域网本地包"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showLocalUpdateDialog()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("安装 GitHub 指定版本"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showSpecificVersionDialog()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("取消"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    self:showOverlay(dialog)
+end
+
+function WeReadDesktop:showLocalUpdateDialog()
+    local InputDialog = require("ui/widget/inputdialog")
+    local saved_url = G_reader_settings:readSetting(
+        LOCAL_UPDATE_URL_SETTING)
+    local input_url = type(self.local_update_url) == "string"
+        and self.local_update_url
+        or (type(saved_url) == "string" and saved_url
+            or DEFAULT_LOCAL_UPDATE_URL)
+    local dialog
+    dialog = InputDialog:new{
+        modal = true,
+        title = _("输入局域网升级包 URL"),
+        input = input_url,
+        description = _(
+            "默认地址中的 192.168.1.100 请改成电脑的局域网 IP。"),
+        buttons = {
+            {
+                {
+                    text = _("取消"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("继续"),
+                    is_enter_default = true,
+                    callback = function()
+                        local url = tostring(dialog:getInputText() or "")
+                            :gsub("^%s+", ""):gsub("%s+$", "")
+                        if not url:match("^https?://") then
+                            self:showInfo(_(
+                                "地址必须以 http:// 或 https:// 开头。"))
+                            return
+                        end
+                        UIManager:close(dialog)
+                        self.local_update_url = url
+                        G_reader_settings:saveSetting(
+                            LOCAL_UPDATE_URL_SETTING, url)
+                        G_reader_settings:flush()
+                        self:confirmAdvancedUpdate{
+                            asset_url = url,
+                            source = "local",
+                        }
+                    end,
+                },
+            },
+        },
+    }
+    self:showInputDialog(dialog)
+end
+
+function WeReadDesktop:showSpecificVersionDialog()
+    local InputDialog = require("ui/widget/inputdialog")
+    local Updater = require("updater")
+    local dialog
+    dialog = InputDialog:new{
+        modal = true,
+        title = _("输入 GitHub 版本号"),
+        input = Updater.current_version(),
+        description = _("例如 0.2.0-alpha.1；支持安装旧版本。"),
+        buttons = {
+            {
+                {
+                    text = _("取消"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("查找"),
+                    is_enter_default = true,
+                    callback = function()
+                        local requested = tostring(dialog:getInputText() or "")
+                            :gsub("^%s+", ""):gsub("%s+$", "")
+                        local version = Updater.normalize_version(requested)
+                        UIManager:close(dialog)
+                        if not version then
+                            self:showInfo(_(
+                                "版本号无效，只支持稳定版、Beta 或 Alpha 的 SemVer。"))
+                            return
+                        end
+                        local client = self.weread and self.weread.client
+                        if not client then
+                            self:showInfo(_(
+                                "更新服务暂不可用，请重启 KOReader 后重试。"))
+                            return
+                        end
+                        self:showBusy(_("正在查找指定版本…"))
+                        self:runOnlineTask(
+                            _("查找指定版本"),
+                            function()
+                                local release, err = Updater.fetch_version(
+                                    client, version)
+                                self:closeBusy()
+                                if not release then
+                                    self:showInfo(_("找不到可安装的指定版本：")
+                                        .. tostring(err))
+                                    return
+                                end
+                                release.source = "github"
+                                self:confirmAdvancedUpdate(release)
+                            end)
+                    end,
+                },
+            },
+        },
+    }
+    self:showInputDialog(dialog)
+end
+
+function WeReadDesktop:confirmAdvancedUpdate(release)
+    if type(release) ~= "table" or not release.asset_url then
+        self:showInfo(_("升级包地址无效，无法安装。"))
+        return
+    end
+    local text
+    if release.source == "local" then
+        text = _("将从局域网地址安装本地升级包：")
+            .. "\n" .. release.asset_url
+    else
+        text = string.format(
+            _("将安装指定版本 v%s（允许降级）。"),
+            tostring(release.version or "?"))
+        if release.channel then
+            text = text .. "\n"
+                .. self:updateChannelRiskLabel(release.channel)
+        end
+        if release.notes and release.notes ~= "" then
+            text = text .. "\n\n" .. release.notes
+        end
+    end
+    text = text .. "\n\n" .. _(
+        "这是高级操作，错误的包可能导致插件无法启动。安装器仍会校验压缩包布局，并在替换失败时保留旧版本。")
+    local ConfirmBox = require("ui/widget/confirmbox")
+    self:showOverlay(ConfirmBox:new{
+        modal = true,
+        dismissable = false,
+        icon = "notice-info",
+        text = text .. "\n\n" .. _("是否继续安装？安装后需要重启 KOReader。"),
+        ok_text = _("安装"),
+        ok_callback = function()
+            self:installPluginUpdate(release.asset_url, release.source)
+        end,
+        cancel_text = _("取消"),
+    })
+end
+
+function WeReadDesktop:installPluginUpdate(asset_url, source)
+    local Updater = require("updater")
+    local client = self.weread and self.weread.client
+    if not client then
+        self:showInfo(_("更新服务暂不可用，请重启 KOReader 后重试。"))
+        return
+    end
+    local plugins_dir = (type(self.path) == "string"
+        and self.path:match("^(.*)/[^/]+$")) or "plugins"
+    local work_dir = require("datastorage"):getDataDir() .. "/cache"
+    local label = source == "local"
+        and _("下载并安装本地升级包") or _("下载并安装更新")
+    local function install()
+        local ok, err = Updater.install(
+            client, asset_url, plugins_dir, work_dir)
+        self:closeBusy()
+        if ok then
+            UIManager:askForRestart(
+                _("微读已更新，重启 KOReader 后生效。"))
+        else
+            self:showInfo(label .. _("失败：") .. tostring(err))
+        end
+    end
+    self:showBusy(label .. "…")
+    if source == "local" then
+        UIManager:scheduleIn(0.1, function()
+            local ok, err = xpcall(install, debug.traceback)
+            if not ok then
+                logger.warn("wereaddesktop: local update failed:", err)
+                self:closeBusy()
+                local message = tostring(err):match("^([^\n]*)") or ""
+                self:showInfo(label .. _("失败：") .. message)
+            end
+        end)
+    else
+        self:runOnlineTask(label, install)
+    end
 end
 
 -- 微读 self-update (GitHub Releases): check, offer, download + install,
@@ -2199,27 +2463,11 @@ function WeReadDesktop:checkPluginUpdate()
         local ConfirmBox = require("ui/widget/confirmbox")
         self:showOverlay(ConfirmBox:new{
             modal = true,
+            icon = "notice-info",
             text = text .. "\n\n" .. _("是否下载并安装？安装后需要重启 KOReader。"),
             ok_text = _("立即更新"),
             ok_callback = function()
-                self:showBusy(_("正在下载并安装更新…"))
-                self:runOnlineTask(_("下载更新"), function()
-                    -- The plugin loader stores the plugin root on the
-                    -- module; its parent is the plugins directory.
-                    local plugins_dir = (type(self.path) == "string"
-                        and self.path:match("^(.*)/[^/]+$")) or "plugins"
-                    local work_dir =
-                        require("datastorage"):getDataDir() .. "/cache"
-                    local ok, err2 = Updater.install(client,
-                        latest.asset_url, plugins_dir, work_dir)
-                    self:closeBusy()
-                    if ok then
-                        UIManager:askForRestart(
-                            _("微读已更新，重启 KOReader 后生效。"))
-                    else
-                        self:showInfo(_("更新失败：") .. tostring(err2))
-                    end
-                end)
+                self:installPluginUpdate(latest.asset_url, "github")
             end,
             cancel_text = _("取消"),
         })
@@ -2809,6 +3057,7 @@ function WeReadDesktop:collectData()
             update_channel = update_channel,
             update_channel_label = Updater.update_channel_label(update_channel),
             update_risk_label = self:updateChannelRiskLabel(update_channel),
+            advanced_update_unlocked = self.advanced_update_unlocked == true,
         }
     end
     return { login_prompt = true }
@@ -2992,6 +3241,12 @@ function WeReadDesktop:showDesktop()
         end,
         on_update_channel = function()
             self:chooseUpdateChannel()
+        end,
+        on_version_tap = function()
+            self:handleVersionTap()
+        end,
+        on_advanced_update = function()
+            self:showAdvancedUpdateMenu()
         end,
         on_check_update = function()
             self:checkPluginUpdate()

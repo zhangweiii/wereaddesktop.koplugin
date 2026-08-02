@@ -16,17 +16,16 @@ end
 package.preload["ui/widget/infomessage"] = function()
     return { new = function(_, value) return value end }
 end
-package.preload["ui/uimanager"] = function()
-    return {
-        _window_stack = {},
-        nextTick = function(_, fn) fn() end,
-        scheduleIn = function(_, _delay, fn) fn() end,
-        setDirty = noop,
-        show = noop,
-        close = noop,
-        broadcastEvent = noop,
-    }
-end
+local ui_manager = {
+    _window_stack = {},
+    nextTick = function(_, fn) fn() end,
+    scheduleIn = function(_, _delay, fn) fn() end,
+    setDirty = noop,
+    show = noop,
+    close = noop,
+    broadcastEvent = noop,
+}
+package.preload["ui/uimanager"] = function() return ui_manager end
 package.preload["progressuploader"] = function()
     return { new = function(_, opts) return opts end }
 end
@@ -88,7 +87,10 @@ end
 function network:promptWifi(callback, _long_press, interactive)
     self.prompt_calls = self.prompt_calls + 1
     self.last_interactive = interactive
-    if callback then callback() end
+    self.dialog = {}
+    table.insert(ui_manager._window_stack, #ui_manager._window_stack,
+        { widget = self.dialog })
+    self.callback = callback
 end
 package.preload["ui/network/manager"] = function() return network end
 
@@ -113,6 +115,12 @@ end
 
 local instance = WeReadDesktop:new{}
 instance.ui = {}
+instance.desktop_widget = {
+    actions = {},
+    setData = noop,
+}
+network.desktop_widget = instance.desktop_widget
+ui_manager._window_stack = { { widget = instance.desktop_widget } }
 instance.collectData = function()
     return { weread = true }
 end
@@ -126,6 +134,9 @@ check("toggle queries the real network state", network.query_calls > 0)
 check("radio-on but disconnected opens KOReader's Wi-Fi choice",
     network.prompt_calls == 1 and network.toggle_off_calls == 0)
 check("direct Wi-Fi action is marked interactive", network.last_interactive == true)
+check("Wi-Fi choice is above the desktop",
+    ui_manager._window_stack[#ui_manager._window_stack].widget
+        == network.dialog)
 
 network.wifi_on = false
 network.connected = false
