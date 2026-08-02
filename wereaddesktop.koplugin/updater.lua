@@ -1,8 +1,9 @@
 --[[--
 Self-update for the WeRead desktop plugin via GitHub Releases.
 
-check:  GET api.github.com/repos/<repo>/releases/latest, compare the
-        tag against wereaddesktop_version.lua.
+check:  GET api.github.com/repos/<repo>/releases/latest for stable, or
+        /releases?per_page=100 for beta/alpha, then compare the tag against
+        wereaddesktop_version.lua.
 install: download the release's .tar.gz asset (built by
         tools/release.sh, with wereaddesktop.koplugin/ at its root) and
         extract it with KOReader's libarchive binding into a staging
@@ -33,9 +34,41 @@ local REQUIRED_FILES = {
 -- "owner/repo" publishing the releases. Override at runtime with the
 -- wereaddesktop_update_repo setting (e.g. for testing a fork).
 local GITHUB_REPO = "zhangweiii/wereaddesktop.koplugin"
+local CHANNEL_LIMIT = {
+    stable = 0,
+    beta = 1,
+    alpha = 2,
+}
+local CHANNEL_LABELS = {
+    stable = "稳定版",
+    beta = "Beta 测试版",
+    alpha = "Alpha 实验版",
+}
 
 function Updater.current_version()
     return VERSION
+end
+
+function Updater.normalize_update_channel(channel)
+    channel = tostring(channel or ""):lower()
+    return CHANNEL_LIMIT[channel] and channel or "stable"
+end
+
+function Updater.update_channel_label(channel)
+    channel = Updater.normalize_update_channel(channel)
+    return CHANNEL_LABELS[channel]
+end
+
+function Updater.get_update_channel()
+    local settings = rawget(_G, "G_reader_settings")
+    if settings and type(settings.readSetting) == "function" then
+        local ok, channel = pcall(settings.readSetting, settings,
+            "wereaddesktop_update_channel")
+        if ok then
+            return Updater.normalize_update_channel(channel)
+        end
+    end
+    return "stable"
 end
 
 function Updater.repo()
@@ -46,70 +79,248 @@ function Updater.repo()
     return GITHUB_REPO
 end
 
--- "v1.2.3" / "1.2" -> { 1, 2, 3 }
-local function parse_version(value)
-    local parts = {}
-    for number in tostring(value or ""):gmatch("%d+") do
-        table.insert(parts, tonumber(number))
-    end
-    return parts
+local function has_leading_zero(value)
+    return #value > 1 and value:sub(1, 1) == "0"
 end
 
--- -1 when a < b, 0 when equal, 1 when a > b (numeric, dotted).
-function Updater.compare(a, b)
-    local pa, pb = parse_version(a), parse_version(b)
-    for i = 1, math.max(#pa, #pb) do
-        local na, nb = pa[i] or 0, pb[i] or 0
-        if na ~= nb then
-            return na < nb and -1 or 1
+local function parse_semver(value)
+    local text = tostring(value or "")
+        :gsub("^%s+", "")
+        :gsub("%s+$", "")
+    local major, minor, patch = text:match("^v?(%d+)%.(%d+)%.(%d+)$")
+    local stage, sequence
+    if not major then
+        major, minor, patch, stage, sequence = text:match(
+            "^v?(%d+)%.(%d+)%.(%d+)%-(%a+)%.(%d+)$")
+        if stage ~= "alpha" and stage ~= "beta" then
+            return nil
         end
     end
-    return 0
+    if not major or has_leading_zero(major)
+        or has_leading_zero(minor) or has_leading_zero(patch)
+        or (sequence and has_leading_zero(sequence)) then
+        return nil
+    end
+    local parsed = {
+        major = tonumber(major),
+        minor = tonumber(minor),
+        patch = tonumber(patch),
+        stage = stage,
+        sequence = sequence and tonumber(sequence) or nil,
+    }
+    parsed.version = string.format("%d.%d.%d", parsed.major,
+        parsed.minor, parsed.patch)
+    if parsed.stage then
+        parsed.version = parsed.version .. "-" .. parsed.stage .. "."
+            .. tostring(parsed.sequence)
+    end
+    return parsed
 end
 
--- Fetch the latest release metadata. Returns
--- { version=, notes=, asset_url=|nil, page_url=|nil } or nil, err.
-function Updater.fetch_latest(client)
+function Updater.release_channel(version)
+    local parsed = parse_semver(version)
+    if not parsed then
+        return nil
+    end
+    return parsed.stage or "stable"
+end
+
+local function channel_is_allowed(candidate, requested)
+    return CHANNEL_LIMIT[candidate] <= CHANNEL_LIMIT[requested]
+end
+
+-- -1 when a < b, 0 when equal, 1 when a > b. Returns nil for an invalid
+-- version so callers cannot accidentally treat an arbitrary tag as a release.
+function Updater.compare(a, b)
+    local pa, pb = parse_semver(a), parse_semver(b)
+    if not pa or not pb then
+        return nil
+    end
+    for _, field in ipairs({ "major", "minor", "patch" }) do
+        if pa[field] ~= pb[field] then
+            return pa[field] < pb[field] and -1 or 1
+        end
+    end
+    if pa.stage == pb.stage then
+        if not pa.stage or pa.sequence == pb.sequence then
+            return 0
+        end
+        return pa.sequence < pb.sequence and -1 or 1
+    end
+    if not pa.stage then
+        return 1
+    end
+    if not pb.stage then
+        return -1
+    end
+    local stage_rank = { alpha = 0, beta = 1 }
+    return stage_rank[pa.stage] < stage_rank[pb.stage] and -1 or 1
+end
+
+local function expected_asset_name(version)
+    return PLUGIN_NAME .. "-v" .. version .. ".tar.gz"
+end
+
+local function find_asset(release, version)
+    local expected = expected_asset_name(version)
+    local legacy_url
+    local assets = type(release.assets) == "table" and release.assets or {}
+    for _, asset in ipairs(assets) do
+        if type(asset) == "table"
+            and type(asset.name) == "string"
+            and type(asset.browser_download_url) == "string" then
+            if asset.name == expected then
+                return asset.browser_download_url
+            end
+            if not legacy_url and asset.name:match("%.tar%.gz$") then
+                legacy_url = asset.browser_download_url
+            end
+        end
+    end
+    return legacy_url
+end
+
+local function next_page_url(headers)
+    local link
+    if type(headers) == "table" then
+        for key, value in pairs(headers) do
+            if type(key) == "string" and key:lower() == "link" then
+                link = value
+                break
+            end
+        end
+    end
+    if type(link) == "table" then
+        link = link[1]
+    end
+    if type(link) ~= "string" then
+        return nil
+    end
+    for part in link:gmatch("[^,]+") do
+        local url, parameters = part:match(
+            "^%s*<([^>]+)>%s*;%s*(.+)%s*$")
+        local relations = parameters
+            and parameters:match('rel%s*=%s*"([^"]+)"')
+        if not relations and parameters then
+            relations = parameters:match("rel%s*=%s*([^;%s]+)")
+        end
+        local has_next = false
+        if relations then
+            for relation in relations:gmatch("%S+") do
+                if relation == "next" then
+                    has_next = true
+                    break
+                end
+            end
+        end
+        if url and has_next then
+            return url
+        end
+    end
+end
+
+local function release_candidate(release, requested_channel)
+    if type(release) ~= "table" or release.draft == true then
+        return nil
+    end
+    local version = release.tag_name
+    local channel = Updater.release_channel(version)
+    if not channel or not channel_is_allowed(channel, requested_channel) then
+        return nil
+    end
+    version = parse_semver(version).version
+    local asset_url = find_asset(release, version)
+    if not asset_url then
+        return nil
+    end
+    return {
+        version = version,
+        channel = channel,
+        notes = tostring(release.body or ""),
+        asset_url = asset_url,
+        page_url = release.html_url,
+    }
+end
+
+-- Fetch the newest installable release accepted by the selected channel.
+-- Returns { version=, channel=, notes=, asset_url=, page_url= } or nil, err.
+function Updater.fetch_latest(client, requested_channel)
+    local channel = Updater.normalize_update_channel(
+        requested_channel or Updater.get_update_channel())
     local repo = Updater.repo()
     if not repo then
         return nil, "repo_not_configured"
     end
-    local body, code = client:request_follow{
-        url = "https://api.github.com/repos/" .. repo .. "/releases/latest",
-        timeout = { 15, 30 },
-        diagnostic_api = "github_latest_release",
-    }
-    if tonumber(code) ~= 200 then
-        return nil, "http_" .. tostring(code or "error")
+    local endpoint = "/releases/latest"
+    if channel ~= "stable" then
+        endpoint = "/releases?per_page=100"
     end
-    local ok, data = pcall(function()
-        return client:json_decode(body)
-    end)
-    if not ok or type(data) ~= "table" then
-        return nil, "bad_response"
+    local request_url = "https://api.github.com/repos/" .. repo .. endpoint
+    local function request_page(url)
+        local body, code, headers = client:request_follow{
+            url = url,
+            timeout = { 15, 30 },
+            diagnostic_api = channel == "stable"
+                and "github_latest_release" or "github_releases",
+        }
+        if tonumber(code) ~= 200 then
+            return nil, "http_" .. tostring(code or "error")
+        end
+        local ok, data = pcall(function()
+            return client:json_decode(body)
+        end)
+        if not ok or type(data) ~= "table" then
+            return nil, "bad_response"
+        end
+        return data, nil, headers
     end
-    local latest = tostring(data.tag_name or data.name or ""):gsub("^%s*v", "")
-    if latest == "" then
-        return nil, "no_version"
+    local data, err, headers = request_page(request_url)
+    if not data then
+        return nil, err
     end
-    local asset_url
-    for _i, asset in ipairs(data.assets or {}) do
-        if type(asset.name) == "string" and asset.name:match("%.tar%.gz$")
-            and type(asset.browser_download_url) == "string" then
-            asset_url = asset.browser_download_url
-            break
+    if channel == "stable" then
+        local latest = release_candidate(data, channel)
+        if not latest then
+            return nil, "no_matching_release"
+        end
+        return latest
+    end
+    local candidates = {}
+    local function collect_candidates(releases)
+        for _, release in ipairs(releases) do
+            local candidate = release_candidate(release, channel)
+            if candidate then
+                table.insert(candidates, candidate)
+            end
         end
     end
-    return {
-        version = latest,
-        notes = tostring(data.body or ""),
-        asset_url = asset_url,
-        page_url = data.html_url,
-    }
+    collect_candidates(data)
+    local visited = { [request_url] = true }
+    local next_url = next_page_url(headers)
+    while next_url do
+        if visited[next_url] then
+            break
+        end
+        visited[next_url] = true
+        local page, page_err, page_headers = request_page(next_url)
+        if not page then
+            return nil, page_err
+        end
+        collect_candidates(page)
+        next_url = next_page_url(page_headers)
+    end
+    if #candidates == 0 then
+        return nil, "no_matching_release"
+    end
+    table.sort(candidates, function(left, right)
+        return Updater.compare(left.version, right.version) > 0
+    end)
+    return candidates[1]
 end
 
 function Updater.is_newer(latest_version)
-    return Updater.compare(latest_version, VERSION) > 0
+    local comparison = Updater.compare(latest_version, VERSION)
+    return comparison ~= nil and comparison > 0
 end
 
 local function close_archive(reader)

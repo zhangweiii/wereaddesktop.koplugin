@@ -25,7 +25,7 @@
 - **状态栏**：时间、Wi-Fi 状态、设置和退出入口
 - **定时熄屏**：设置标签页可调整无操作自动休眠时长（关 / 5 / 15 / 30 / 60 分钟，复用 KOReader 内置 autosuspend 插件，默认 15 分钟）
 - **设备快捷设置**：设置标签页提供前光（亮度/色温）、夜间模式、Wi-Fi、屏幕旋转、屏保类型、时钟格式（12/24 小时制）开关，全部走 KOReader 官方公开接口；顶部显示电量和存储状态
-- **检查更新**：设置标签页可检查微读自身的新版本（GitHub Releases），发现新版本可一键下载安装（发布流程见下文「发布」）
+- **检查更新**：设置页可选择稳定版、Beta 测试版或 Alpha 实验版，并手动检查 GitHub Releases；发现新版本可一键下载安装（发布流程见下文「发布」）
 
 ## 截图
 
@@ -125,12 +125,14 @@ PLUGIN_DIR=/absolute/path/to/wereaddesktop.koplugin
 
 ## 发布
 
-版本号唯一来源是 `wereaddesktop.koplugin/wereaddesktop_version.lua`。发布新版本：
+版本号唯一来源是 `wereaddesktop.koplugin/wereaddesktop_version.lua`，使用 SemVer；稳定版使用 `0.2.0`，预发布版使用 `0.2.0-beta.1` 或 `0.2.0-alpha.1`。发布新版本：
 
 1. 更新 `wereaddesktop_version.lua` 中的版本号。
 2. 运行 `sh tools/release.sh` 生成 `dist/wereaddesktop.koplugin-v<版本>.tar.gz`。
-3. 提交版本号后，在 GitHub 上推送 `v<版本>` 标签：`release.yml` 会自动构建 tar.gz 并创建 Release（插件的「检查更新」只认 `.tar.gz` 附件，且压缩包根目录必须是 `wereaddesktop.koplugin/`）。
+3. 提交版本号后，在 GitHub 上推送 `v<版本>` 标签：`release.yml` 会自动构建 tar.gz 并创建 Release，带 `-alpha.N` / `-beta.N` 后缀的版本会标记为 GitHub prerelease（插件的「检查更新」只认完整名称的 `.tar.gz` 附件，且压缩包根目录必须是 `wereaddesktop.koplugin/`）。
 4. 发布仓库已配置在 `wereaddesktop.koplugin/updater.lua` 的 `GITHUB_REPO` 常量（当前为 `zhangweiii/wereaddesktop.koplugin`）；如需临时指向其它仓库（测试 fork），可通过 KOReader 设置 `wereaddesktop_update_repo` 覆盖。
+
+更新频道表示最多接受的风险级别：稳定版只接受稳定版，Beta 接受稳定版和 Beta，Alpha 接受三者。频道切换不会降级已安装版本；缺少 `wereaddesktop_update_channel` 或值非法时按稳定版处理。Alpha 可能无法启动，不建议在重要设备上使用。
 
 ## 安全与信任边界
 

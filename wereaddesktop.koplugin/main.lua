@@ -2078,18 +2078,97 @@ function WeReadDesktop:deviceStatus()
     return table.concat(parts, " · ")
 end
 
+function WeReadDesktop:updateChannelRiskLabel(channel)
+    local Updater = require("updater")
+    channel = Updater.normalize_update_channel(channel)
+    if channel == "alpha" then
+        return _("Alpha 实验版：可能无法启动或影响正常使用，不建议在重要设备上使用。")
+    end
+    if channel == "beta" then
+        return _("Beta 测试版：新功能先行体验，偶尔可能存在问题。")
+    end
+    return _("稳定版：适合日常使用。")
+end
+
+function WeReadDesktop:chooseUpdateChannel()
+    local Updater = require("updater")
+    local current = Updater.get_update_channel()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+    local choices = {
+        {
+            channel = "stable",
+            text = _("稳定版：适合日常使用"),
+        },
+        {
+            channel = "beta",
+            text = _("Beta 测试版：新功能先行体验，偶尔可能有问题"),
+        },
+        {
+            channel = "alpha",
+            text = _("Alpha 实验版：可能无法启动，不建议在重要设备上使用"),
+        },
+    }
+    local buttons = {}
+    for _, choice in ipairs(choices) do
+        local selected_channel = choice.channel
+        local selected = selected_channel == current
+        local choice_text = choice.text
+        table.insert(buttons, {
+            {
+                text = (selected and "✓ " or "") .. choice_text,
+                callback = function()
+                    UIManager:close(dialog)
+                    G_reader_settings:saveSetting(
+                        "wereaddesktop_update_channel", selected_channel)
+                    G_reader_settings:flush()
+                    self:showTransientInfo(
+                        _("更新频道：") .. Updater.update_channel_label(
+                            selected_channel), 2)
+                    self:refreshDesktop()
+                end,
+            },
+        })
+    end
+    table.insert(buttons, {
+        {
+            text = _("取消"),
+            callback = function()
+                UIManager:close(dialog)
+            end,
+        },
+    })
+    dialog = ButtonDialog:new{
+        modal = true,
+        dismissable = false,
+        title = _("选择更新频道"),
+        buttons = buttons,
+    }
+    self:showOverlay(dialog)
+end
+
 -- 微读 self-update (GitHub Releases): check, offer, download + install,
 -- then ask for a KOReader restart. Works without a WeRead login — only
 -- the bridge's generic HTTP client is used.
 function WeReadDesktop:checkPluginUpdate()
     local Updater = require("updater")
+    local channel = Updater.get_update_channel()
+    local client = self.weread and self.weread.client
+    if not client then
+        self:showInfo(_("更新服务暂不可用，请重启 KOReader 后重试。"))
+        return
+    end
     self:showBusy(_("正在检查更新…"))
     self:runOnlineTask(_("检查更新"), function()
-        local latest, err = Updater.fetch_latest(self.weread.client)
+        local latest, err = Updater.fetch_latest(client, channel)
         self:closeBusy()
         if not latest then
             if err == "repo_not_configured" then
                 self:showInfo(_("尚未配置发布仓库，无法检查更新。"))
+            elseif err == "no_matching_release" then
+                self:showInfo(string.format(
+                    _("当前频道为%s，没有找到可安装的发布版本。"),
+                    Updater.update_channel_label(channel)))
             else
                 self:showInfo(_("检查更新失败：") .. tostring(err))
             end
@@ -2097,11 +2176,18 @@ function WeReadDesktop:checkPluginUpdate()
         end
         if not Updater.is_newer(latest.version) then
             self:showTransientInfo(string.format(
-                _("已是最新版本 v%s"), Updater.current_version()), 2)
+                _("当前为%s v%s，没有可升级版本（不会降级）。"),
+                Updater.update_channel_label(channel),
+                Updater.current_version()), 3)
             return
         end
-        local text = string.format(_("发现新版本 v%s（当前 v%s）"),
-            latest.version, Updater.current_version())
+        local text = string.format(_("发现新版本 v%s（%s，当前 v%s）"),
+            latest.version,
+            Updater.update_channel_label(latest.channel),
+            Updater.current_version())
+        if latest.channel == "alpha" then
+            text = text .. "\n\n" .. self:updateChannelRiskLabel("alpha")
+        end
         if latest.notes ~= "" then
             text = text .. "\n\n" .. latest.notes
         end
@@ -2124,7 +2210,7 @@ function WeReadDesktop:checkPluginUpdate()
                         and self.path:match("^(.*)/[^/]+$")) or "plugins"
                     local work_dir =
                         require("datastorage"):getDataDir() .. "/cache"
-                    local ok, err2 = Updater.install(self.weread.client,
+                    local ok, err2 = Updater.install(client,
                         latest.asset_url, plugins_dir, work_dir)
                     self:closeBusy()
                     if ok then
@@ -2688,6 +2774,8 @@ function WeReadDesktop:collectData()
         if ok_pending then
             pending_summary = pending
         end
+        local Updater = require("updater")
+        local update_channel = Updater.get_update_channel()
         return {
             weread = true,
             account_name = self.weread:getAccountName(),
@@ -2718,6 +2806,9 @@ function WeReadDesktop:collectData()
             screensaver_label = self:screensaverLabel(),
             clock_label = self:clockLabel(),
             plugin_version = require("wereaddesktop_version"),
+            update_channel = update_channel,
+            update_channel_label = Updater.update_channel_label(update_channel),
+            update_risk_label = self:updateChannelRiskLabel(update_channel),
         }
     end
     return { login_prompt = true }
@@ -2898,6 +2989,9 @@ function WeReadDesktop:showDesktop()
         end,
         on_toggle_clock = function()
             self:toggleClockFormat()
+        end,
+        on_update_channel = function()
+            self:chooseUpdateChannel()
         end,
         on_check_update = function()
             self:checkPluginUpdate()

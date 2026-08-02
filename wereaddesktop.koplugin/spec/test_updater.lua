@@ -125,6 +125,9 @@ G_reader_settings = {
     readSetting = function(self, key)
         return self.store[key]
     end,
+    saveSetting = function(self, key, value)
+        self.store[key] = value
+    end,
 }
 
 local Updater = require("updater")
@@ -144,15 +147,23 @@ end
 local function make_client(release)
     return {
         last_url = nil,
+        urls = {},
         request_follow = function(self, opts)
             self.last_url = opts.url
-            if not release then
+            table.insert(self.urls, opts.url)
+            local response = release
+            if release and release.__pages then
+                response = release.__pages[opts.url] or release
+            end
+            if not response then
                 return nil, 404
             end
-            return release.__raw, 200
+            self.decode_data = response
+            return response.__raw or "{}", response.__code or 200,
+                response.__headers
         end,
-        json_decode = function()
-            return release
+        json_decode = function(self)
+            return self.decode_data or release
         end,
     }
 end
@@ -164,23 +175,52 @@ check("compare: equal versions", Updater.compare("0.1.0", "0.1.0") == 0)
 check("compare: newer patch", Updater.compare("0.2.0", "0.1.0") == 1)
 check("compare: older", Updater.compare("0.1.0", "1.0.0") == -1)
 check("compare: v-prefix and short forms",
-    Updater.compare("v0.1.0", "0.1") == 0
+    Updater.compare("v0.1.0", "0.1.0") == 0
     and Updater.compare("0.10.0", "0.9.9") == 1)
+check("compare: prerelease order",
+    Updater.compare("0.2.0-alpha.1", "0.2.0-alpha.2") == -1
+    and Updater.compare("0.2.0-alpha.2", "0.2.0-beta.1") == -1
+    and Updater.compare("0.2.0-beta.1", "0.2.0") == -1)
+check("compare: prerelease sequence is numeric",
+    Updater.compare("0.2.0-beta.10", "0.2.0-beta.2") == 1)
+check("stable version is newer than its prereleases",
+    Updater.compare("0.2.0", "0.2.0-beta.10") == 1)
+check("switching from a newer alpha cannot downgrade",
+    Updater.compare("0.2.5", "0.3.0-alpha.1") == -1)
+check("release_channel recognizes supported tags",
+    Updater.release_channel("v0.2.0") == "stable"
+    and Updater.release_channel("0.2.0-beta.1") == "beta"
+    and Updater.release_channel("0.2.0-alpha.1") == "alpha"
+    and Updater.release_channel("0.2.0-rc.1") == nil)
+G_reader_settings.store.wereaddesktop_update_channel = "unknown"
+check("unknown or missing channel defaults to stable",
+    Updater.get_update_channel() == "stable")
+G_reader_settings.store.wereaddesktop_update_channel = "beta"
+check("configured channel is normalized", Updater.get_update_channel() == "beta")
 check("is_newer against the bundled version",
     Updater.is_newer("999.0.0") == true
-    and Updater.is_newer(Updater.current_version()) == false)
+    and Updater.is_newer(Updater.current_version()) == false
+    and Updater.is_newer("0.2.0-rc.1") == false)
 
 ----------------------------------------------------------------
 -- fetch_latest: repo configuration, parsing, asset discovery.
 ----------------------------------------------------------------
 do
+    G_reader_settings.store.wereaddesktop_update_channel = "stable"
     -- No override: the baked-in default repo is used.
-    local client = make_client{ __raw = "{}", tag_name = "v9.9.9" }
+    local client = make_client{
+        __raw = "{}", tag_name = "v9.9.9",
+        assets = {
+            { name = "wereaddesktop.koplugin-v9.9.9.tar.gz",
+                browser_download_url = "https://x/default.tar.gz" },
+        },
+    }
     local latest = Updater.fetch_latest(client)
     check("default repo is zhangweiii/wereaddesktop.koplugin",
         client.last_url
         == "https://api.github.com/repos/zhangweiii/wereaddesktop.koplugin/releases/latest"
-        and latest and latest.version == "9.9.9")
+        and latest and latest.version == "9.9.9"
+        and latest.channel == "stable")
 
     G_reader_settings.store.wereaddesktop_update_repo = "someone/koui"
     local release = {
@@ -206,14 +246,126 @@ do
     check("fetch_latest picks the .tar.gz asset",
         latest and latest.asset_url == "https://x/pkg.tar.gz")
 
-    -- Release without a tarball asset: asset_url stays nil.
+    -- Releases without the exact installable asset are skipped.
     client = make_client{
         __raw = "{}", tag_name = "v0.2.0",
         assets = { { name = "notes.txt", browser_download_url = "https://x/n" } },
     }
-    latest = Updater.fetch_latest(client)
-    check("release without tarball asset -> asset_url nil",
-        latest and latest.asset_url == nil)
+    latest, err = Updater.fetch_latest(client)
+    check("release without installable asset is skipped",
+        latest == nil and err == "no_matching_release")
+
+    client = make_client{
+        __raw = "{}", tag_name = "v0.2.0",
+        assets = {
+            { name = "legacy-release.tar.gz",
+                browser_download_url = "https://x/legacy.tar.gz" },
+        },
+    }
+    latest, err = Updater.fetch_latest(client)
+    check("legacy tar.gz asset remains compatible",
+        latest and latest.asset_url == "https://x/legacy.tar.gz")
+
+    client = make_client{
+        __raw = "{}", tag_name = "v0.3.0-beta.1",
+        assets = {
+            { name = "wereaddesktop.koplugin-v0.3.0-beta.1.tar.gz",
+                browser_download_url = "https://x/beta.tar.gz" },
+        },
+    }
+    latest, err = Updater.fetch_latest(client, "stable")
+    check("stable channel rejects prerelease tags",
+        latest == nil and err == "no_matching_release")
+
+    local releases = {
+        {
+            tag_name = "v0.2.0-beta.2",
+            assets = {
+                { name = "wereaddesktop.koplugin-v0.2.0-beta.2.tar.gz",
+                    browser_download_url = "https://x/beta2.tar.gz" },
+            },
+        },
+        {
+            tag_name = "v0.2.0-beta.10",
+            assets = {
+                { name = "wereaddesktop.koplugin-v0.2.0-beta.10.tar.gz",
+                    browser_download_url = "https://x/beta10.tar.gz" },
+            },
+        },
+        {
+            tag_name = "v0.2.0-alpha.1",
+            assets = {
+                { name = "wereaddesktop.koplugin-v0.2.0-alpha.1.tar.gz",
+                    browser_download_url = "https://x/alpha1.tar.gz" },
+            },
+        },
+        {
+            tag_name = "v0.1.4",
+            assets = {
+                { name = "wereaddesktop.koplugin-v0.1.4.tar.gz",
+                    browser_download_url = "https://x/stable.tar.gz" },
+            },
+        },
+        { tag_name = "v9.0.0-rc.1", prerelease = true },
+        { tag_name = "v9.0.0-beta.99", draft = true },
+        {
+            tag_name = "v9.0.0-alpha.99",
+            assets = { { name = "notes.txt", browser_download_url = "https://x/n" } },
+        },
+    }
+    releases.__raw = "[]"
+    G_reader_settings.store.wereaddesktop_update_channel = "beta"
+    client = make_client(releases)
+    latest, err = Updater.fetch_latest(client)
+    check("beta channel queries the releases list",
+        client.last_url
+        == "https://api.github.com/repos/someone/koui/releases?per_page=100")
+    check("beta channel accepts stable and beta, picks beta.10",
+        latest and latest.version == "0.2.0-beta.10"
+        and latest.channel == "beta"
+        and latest.asset_url == "https://x/beta10.tar.gz")
+
+    G_reader_settings.store.wereaddesktop_update_channel = "alpha"
+    latest, err = Updater.fetch_latest(client)
+    check("alpha channel accepts stable, beta and alpha",
+        latest and latest.version == "0.2.0-beta.10"
+        and latest.channel == "beta" and err == nil)
+
+    local paginated = {
+        {
+            tag_name = "v0.2.0-beta.1",
+            assets = {
+                { name = "wereaddesktop.koplugin-v0.2.0-beta.1.tar.gz",
+                    browser_download_url = "https://x/page1.tar.gz" },
+            },
+        },
+    }
+    paginated.__raw = "[]"
+    local page_2_url =
+        "https://api.github.com/repos/someone/koui/releases?per_page=100&page=2"
+    paginated.__headers = {
+        Link = '<' .. page_2_url .. '>; rel="next"',
+    }
+    paginated.__pages = {
+        [page_2_url] = {
+            {
+                tag_name = "v0.4.0-beta.1",
+                assets = {
+                    { name = "wereaddesktop.koplugin-v0.4.0-beta.1.tar.gz",
+                        browser_download_url = "https://x/page2.tar.gz" },
+                },
+            },
+        },
+    }
+    client = make_client(paginated)
+    latest, err = Updater.fetch_latest(client, "beta")
+    check("beta channel follows GitHub pagination",
+        latest and latest.version == "0.4.0-beta.1"
+        and latest.asset_url == "https://x/page2.tar.gz")
+    check("pagination requests the next page",
+        client.urls[2] == page_2_url)
+
+    G_reader_settings.store.wereaddesktop_update_channel = "stable"
 
     -- HTTP failure propagates as an error.
     client = make_client(nil)

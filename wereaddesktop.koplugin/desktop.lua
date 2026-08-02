@@ -406,6 +406,7 @@ local SettingsRow = InputContainer:extend{
     dimen = nil,
     label = nil,
     value = nil,
+    chevron = nil,
     callback = nil,
 }
 
@@ -421,8 +422,12 @@ function SettingsRow:init()
     local value_w = 0
     local value_widget
     if self.value then
+        local value_text = tostring(self.value)
+        if self.chevron then
+            value_text = value_text .. "  >"
+        end
         value_widget = TextWidget:new{
-            text = self.value,
+            text = value_text,
             face = Font:getFace("xx_smallinfofont"),
             fgcolor = Blitbuffer.COLOR_GRAY_5,
         }
@@ -490,7 +495,7 @@ local BookshelfWidget = InputContainer:extend{
     covers_fullscreen = true, -- hint for UIManager:_repaint()
     data = nil,
     actions = nil,
-    settings_sub_page = nil, -- nil | "device" — sub-page state
+    settings_sub_page = nil, -- nil | read | device | shelf | update | account
     on_open_book = nil,
     on_book_hold = nil, -- long-press on a shelf book: download options
     on_login = nil, -- function(), starts the WeRead QR login
@@ -507,6 +512,8 @@ local BookshelfWidget = InputContainer:extend{
     on_sync_status = nil,
     on_read_stats = nil,
     on_device_settings = nil, -- opens the device settings sub-page
+    on_update_channel = nil,
+    on_check_update = nil,
     on_refresh_shelf = nil,
     on_relogin = nil,
     on_logout = nil,
@@ -1228,15 +1235,104 @@ function BookshelfWidget:changeStorePage(section_index, delta)
     UIManager:setDirty(self, "ui")
 end
 
---[[--
-The WeRead settings tab: account card on top, then action rows grouped
-into read / device / tools / info.  Long lists of device quick-settings
-(light, night mode, wifi …) live on a secondary page reached by tapping
-"设备快捷设置 ▸"; a back button in its header returns to the main page.
---]]--
+-- Build one settings sub-page with the shared top/bottom chrome and compact
+-- rows. The page identifiers intentionally stay as plain strings so the
+-- widget remains independent of the settings implementation in main.lua.
+function BookshelfWidget:buildSettingsSubPage(title, rows, options)
+    options = options or {}
+    local screen_w = self.dimen.w
+    local screen_h = self.dimen.h
+    local margin = Screen:scaleBySize(28)
+    local content_w = screen_w - 2 * margin
+    local page = VerticalGroup:new{ align = "left" }
+    local used_h = 0
+    local function add(widget, h)
+        table.insert(page, widget)
+        used_h = used_h + (h or widget:getSize().h)
+    end
+
+    local top_pad = Screen:scaleBySize(options.compact and 8 or 16)
+    add(VerticalSpan:new{ width = top_pad }, top_pad)
+    add(self:buildTopBar(content_w))
+    add(VerticalSpan:new{ width = Screen:scaleBySize(options.compact and 4 or 8) })
+    add(self:separator(content_w))
+
+    local base_row_h = Screen:scaleBySize(options.compact and 36 or 44)
+    add(SettingsRow:new{
+        dimen = Geom:new{ w = content_w, h = base_row_h },
+        label = options.back_label or ("← " .. _("返回")),
+        callback = function()
+            self.settings_sub_page = nil
+            self:buildUI()
+            UIManager:setDirty(self, "full")
+        end,
+    }, base_row_h)
+    add(self:separator(content_w))
+    if not options.compact then
+        add(VerticalSpan:new{ width = Screen:scaleBySize(10) })
+        add(TextWidget:new{
+            text = title,
+            face = Font:getFace("smalltfont"),
+        })
+        if options.description then
+            add(VerticalSpan:new{ width = Screen:scaleBySize(6) })
+            add(TextWidget:new{
+                text = options.description,
+                face = Font:getFace("xx_smallinfofont"),
+                fgcolor = Blitbuffer.COLOR_GRAY_5,
+                max_width = content_w,
+            })
+        end
+        if options.status then
+            add(VerticalSpan:new{ width = Screen:scaleBySize(8) })
+            add(TextWidget:new{
+                text = options.status,
+                face = Font:getFace("xx_smallinfofont"),
+                fgcolor = Blitbuffer.COLOR_GRAY_9,
+                max_width = content_w,
+            })
+        end
+        add(VerticalSpan:new{ width = Screen:scaleBySize(8) })
+        add(self:separator(content_w))
+    end
+
+    local row_h = base_row_h
+    local row_unit = row_h + Size.line.thin
+    local avail_h = screen_h - used_h - self:tabBarHeight()
+    if #rows * row_unit > avail_h then
+        row_h = math.max(Screen:scaleBySize(30),
+            math.floor((avail_h - (#rows - 1) * Size.line.thin) / #rows))
+    end
+    for _, def in ipairs(rows) do
+        add(SettingsRow:new{
+            dimen = Geom:new{ w = content_w, h = row_h },
+            label = def.label,
+            value = def.value,
+            callback = def.callback,
+            chevron = def.chevron,
+        }, row_h)
+        add(self:separator(content_w))
+    end
+    self:wrapWereadPage(page, used_h)
+end
+
+function BookshelfWidget:openSettingsPage(page)
+    self.settings_sub_page = page
+    self:buildUI()
+    UIManager:setDirty(self, "full")
+end
+
 function BookshelfWidget:buildSettingsUI()
-    if self.settings_sub_page == "device" then
-        self:buildDeviceSettingsUI()
+    local builders = {
+        read = function() self:buildReadSettingsUI() end,
+        device = function() self:buildDeviceSettingsUI() end,
+        shelf = function() self:buildShelfSettingsUI() end,
+        update = function() self:buildUpdateSettingsUI() end,
+        account = function() self:buildAccountSettingsUI() end,
+    }
+    local builder = builders[self.settings_sub_page]
+    if builder then
+        builder()
         return
     end
 
@@ -1244,7 +1340,6 @@ function BookshelfWidget:buildSettingsUI()
     local screen_h = self.dimen.h
     local margin = Screen:scaleBySize(28)
     local content_w = screen_w - 2 * margin
-
     local page = VerticalGroup:new{ align = "left" }
     local used_h = 0
     local function add(widget, h)
@@ -1253,104 +1348,54 @@ function BookshelfWidget:buildSettingsUI()
     end
 
     local top_pad = Screen:scaleBySize(16)
-    local topbar = self:buildTopBar(content_w)
     add(VerticalSpan:new{ width = top_pad }, top_pad)
-    add(topbar)
+    add(self:buildTopBar(content_w))
     add(VerticalSpan:new{ width = Screen:scaleBySize(8) })
     add(self:separator(content_w))
-
-    -- ---- Account card --------------------------------------------------
-    add(VerticalSpan:new{ width = Screen:scaleBySize(20) })
+    add(VerticalSpan:new{ width = Screen:scaleBySize(14) })
     add(TextWidget:new{
         text = self.data.account_name or _("微信读书用户"),
         face = Font:getFace("smalltfont"),
     })
-    add(VerticalSpan:new{ width = Screen:scaleBySize(20) })
-    add(self:separator(content_w))
-
-    -- ---- Device status line --------------------------------------------
     if self.data.device_status and self.data.device_status ~= "" then
-        add(VerticalSpan:new{ width = Screen:scaleBySize(12) })
+        add(VerticalSpan:new{ width = Screen:scaleBySize(6) })
         add(TextWidget:new{
             text = self.data.device_status,
             face = Font:getFace("xx_smallinfofont"),
             fgcolor = Blitbuffer.COLOR_GRAY_9,
         })
-        add(VerticalSpan:new{ width = Screen:scaleBySize(12) })
-        add(self:separator(content_w))
     end
+    add(VerticalSpan:new{ width = Screen:scaleBySize(12) })
+    add(self:separator(content_w))
 
-    -- ---- Action rows, grouped by section --------------------------------
-    local row_h = Screen:scaleBySize(44)
-    local rows = {}
-    -- 阅读
-    table.insert(rows, {
-        label = _("同步阅读进度"),
-        value = self.data.sync_progress and _("开") or _("关"),
-        callback = self.on_toggle_sync,
-    })
-    table.insert(rows, {
-        label = _("离线阅读时长"),
-        value = self.data.sync_status_label or _("无待上报"),
-        callback = self.on_sync_status,
-    })
-    table.insert(rows, {
-        label = _("自动显示桌面（启动和退出书籍时）"),
-        value = self.data.auto_start and _("开") or _("关"),
-        callback = self.on_toggle_autostart,
-    })
-    table.insert(rows, {
-        label = _("定时熄屏（无操作自动休眠）"),
-        value = self.data.autosuspend_label,
-        callback = self.on_set_autosuspend,
-    })
-    table.insert(rows, {
-        label = _("书架排序"),
-        value = self.data.shelf_sort_label,
-        callback = self.on_cycle_shelf_sort,
-    })
-    table.insert(rows, {
-        label = _("阅读统计"),
-        value = _("查看"),
-        callback = self.on_read_stats,
-    })
-    table.insert(rows, {
-        label = _("微读缓存"),
-        value = self.data.storage_label or _("查看"),
-        callback = self.on_storage,
-    })
-    if self.data.has_frontlight then
-        table.insert(rows, {
-            label = _("前光（亮度/色温）"),
-            value = _("调节"),
-            callback = self.on_frontlight,
-        })
+    local function navigate(page_id)
+        return function() self:openSettingsPage(page_id) end
     end
-    -- 设备 → sub-page
-    table.insert(rows, {
-        label = _("设备快捷设置"),
-        value = "▸",
-        callback = function()
-            self.settings_sub_page = "device"
-            self:buildUI()
-            UIManager:setDirty(self, "full")
-        end,
-    })
-    -- 工具
-    table.insert(rows, { label = _("刷新书架"), callback = self.on_refresh_shelf })
-    table.insert(rows, { label = _("重新扫码登录"), callback = self.on_relogin })
-    table.insert(rows, { label = _("退出登录"), callback = self.on_logout })
-    -- 关于
-    table.insert(rows, {
-        label = _("检查更新"),
-        value = self.data.plugin_version
-            and ("v" .. self.data.plugin_version) or nil,
-        callback = self.on_check_update,
-    })
-    table.insert(rows, { label = _("关于"), callback = self.on_about })
+    local rows = {
+        { label = _("阅读与同步"), chevron = true, callback = navigate("read") },
+        { label = _("桌面与设备"), chevron = true, callback = navigate("device") },
+        {
+            label = _("书架与缓存"), value = self.data.storage_label,
+            chevron = true,
+            callback = navigate("shelf"),
+        },
+        {
+            label = _("更新与版本"),
+            value = self.data.update_channel_label,
+            chevron = true,
+            callback = navigate("update"),
+        },
+        {
+            label = _("账户与关于"),
+            chevron = true,
+            callback = navigate("account"),
+        },
+    }
+    local row_h = Screen:scaleBySize(44)
     local avail_h = screen_h - used_h - self:tabBarHeight()
-    if #rows * row_h > avail_h then
-        row_h = math.max(Screen:scaleBySize(30), math.floor(avail_h / #rows))
+    if #rows * (row_h + Size.line.thin) > avail_h then
+        row_h = math.max(Screen:scaleBySize(30),
+            math.floor((avail_h - (#rows - 1) * Size.line.thin) / #rows))
     end
     for _, def in ipairs(rows) do
         add(SettingsRow:new{
@@ -1358,100 +1403,122 @@ function BookshelfWidget:buildSettingsUI()
             label = def.label,
             value = def.value,
             callback = def.callback,
+            chevron = def.chevron,
         }, row_h)
         add(self:separator(content_w))
     end
-
     self:wrapWereadPage(page, used_h)
 end
 
--- Device quick-settings sub-page: the same top-bar / tab-bar chrome as
--- the main settings page, with a "← 返回" row (no button border) at the
--- top of the content area to go back.  The device status line and the
--- six quick-setting rows follow.
+function BookshelfWidget:buildReadSettingsUI()
+    self:buildSettingsSubPage(_("阅读与同步"), {
+        {
+            label = _("同步阅读进度"),
+            value = self.data.sync_progress and _("开") or _("关"),
+            callback = self.on_toggle_sync,
+        },
+        {
+            label = _("离线阅读时长"),
+            value = self.data.sync_status_label or _("无待上报"),
+            callback = self.on_sync_status,
+        },
+        { label = _("阅读统计"), value = _("查看"), callback = self.on_read_stats },
+    })
+end
+
 function BookshelfWidget:buildDeviceSettingsUI()
-    local screen_w = self.dimen.w
-    local screen_h = self.dimen.h
-    local margin = Screen:scaleBySize(28)
-    local content_w = screen_w - 2 * margin
-
-    local page = VerticalGroup:new{ align = "left" }
-    local used_h = 0
-    local function add(widget, h)
-        table.insert(page, widget)
-        used_h = used_h + (h or widget:getSize().h)
-    end
-
-    local top_pad = Screen:scaleBySize(16)
-    local topbar = self:buildTopBar(content_w)
-    add(VerticalSpan:new{ width = top_pad }, top_pad)
-    add(topbar)
-    add(VerticalSpan:new{ width = Screen:scaleBySize(8) })
-    add(self:separator(content_w))
-
-    -- ---- Back row -------------------------------------------------------
-    local row_h = Screen:scaleBySize(44)
-    add(SettingsRow:new{
-        dimen = Geom:new{ w = content_w, h = row_h },
-        label = "← " .. _("返回"),
-        callback = function()
-            self.settings_sub_page = nil
-            self:buildUI()
-            UIManager:setDirty(self, "full")
-        end,
-    }, row_h)
-    add(self:separator(content_w))
-
-    -- ---- Device status line ---------------------------------------------
-    if self.data.device_status and self.data.device_status ~= "" then
-        add(VerticalSpan:new{ width = Screen:scaleBySize(12) })
-        add(TextWidget:new{
-            text = self.data.device_status,
-            face = Font:getFace("xx_smallinfofont"),
-            fgcolor = Blitbuffer.COLOR_GRAY_9,
+    local rows = {
+        {
+            label = _("自动显示桌面（启动和退出书籍时）"),
+            value = self.data.auto_start and _("开") or _("关"),
+            callback = self.on_toggle_autostart,
+        },
+        {
+            label = _("定时熄屏（无操作自动休眠）"),
+            value = self.data.autosuspend_label,
+            callback = self.on_set_autosuspend,
+        },
+    }
+    if self.data.has_frontlight then
+        table.insert(rows, {
+            label = _("前光（亮度/色温）"), value = _("调节"),
+            callback = self.on_frontlight,
         })
-        add(VerticalSpan:new{ width = Screen:scaleBySize(12) })
-        add(self:separator(content_w))
     end
-
-    -- ---- Device quick-settings rows -------------------------------------
-    local rows = {}
     table.insert(rows, {
         label = _("夜间模式（反色）"),
         value = self.data.night_mode and _("开") or _("关"),
         callback = self.on_toggle_night_mode,
     })
     table.insert(rows, {
-        label = _("Wi-Fi"),
-        value = self.data.wifi_on and _("开") or _("关"),
+        label = _("Wi-Fi"), value = self.data.wifi_on and _("开") or _("关"),
         callback = self.on_toggle_wifi,
     })
     table.insert(rows, {
-        label = _("屏幕旋转"),
-        value = self.data.rotation_label,
+        label = _("屏幕旋转"), value = self.data.rotation_label,
         callback = self.on_cycle_rotation,
     })
     table.insert(rows, {
-        label = _("屏保"),
-        value = self.data.screensaver_label,
+        label = _("屏保"), value = self.data.screensaver_label,
         callback = self.on_cycle_screensaver,
     })
     table.insert(rows, {
-        label = _("时钟格式"),
-        value = self.data.clock_label,
+        label = _("时钟格式"), value = self.data.clock_label,
         callback = self.on_toggle_clock,
     })
-    for _, def in ipairs(rows) do
-        add(SettingsRow:new{
-            dimen = Geom:new{ w = content_w, h = row_h },
-            label = def.label,
-            value = def.value,
-            callback = def.callback,
-        }, row_h)
-        add(self:separator(content_w))
-    end
+    self:buildSettingsSubPage(_("桌面与设备"), rows, {
+        compact = true,
+        back_label = "← " .. _("桌面与设备"),
+    })
+end
 
-    self:wrapWereadPage(page, used_h)
+function BookshelfWidget:buildShelfSettingsUI()
+    self:buildSettingsSubPage(_("书架与缓存"), {
+        {
+            label = _("书架排序"), value = self.data.shelf_sort_label,
+            callback = self.on_cycle_shelf_sort,
+        },
+        { label = _("刷新书架"), value = _("刷新"), callback = self.on_refresh_shelf },
+        {
+            label = _("微读缓存"), value = self.data.storage_label or _("查看"),
+            callback = self.on_storage,
+        },
+    })
+end
+
+function BookshelfWidget:buildUpdateSettingsUI()
+    local channel = self.data.update_channel_label or _("稳定版")
+    local risk = self.data.update_risk_label
+    self:buildSettingsSubPage(_("更新与版本"), {
+        {
+            label = _("当前版本"),
+            value = self.data.plugin_version
+                and ("v" .. self.data.plugin_version) or "-",
+            chevron = false,
+        },
+        {
+            label = _("更新频道"), value = channel,
+            chevron = true,
+            callback = self.on_update_channel,
+        },
+        {
+            label = _("检查更新"),
+            value = self.data.plugin_version
+                and ("v" .. self.data.plugin_version) or nil,
+            callback = self.on_check_update,
+        },
+    }, {
+        description = _("更新只在你点击检查时进行，安装后需要重启 KOReader。"),
+        status = risk,
+    })
+end
+
+function BookshelfWidget:buildAccountSettingsUI()
+    self:buildSettingsSubPage(_("账户与关于"), {
+        { label = _("重新扫码登录"), value = _("登录"), callback = self.on_relogin },
+        { label = _("退出登录"), value = _("退出"), callback = self.on_logout },
+        { label = _("关于"), value = _("查看"), callback = self.on_about },
+    })
 end
 
 --[[--
@@ -1506,6 +1573,17 @@ function BookshelfWidget:buildLoginUI()
                     end
                 end,
             },
+            VerticalSpan:new{ width = Screen:scaleBySize(12) },
+            Button:new{
+                text = _("检查更新"),
+                width = Screen:scaleBySize(240),
+                show_parent = self,
+                callback = function()
+                    if self.on_check_update then
+                        self.on_check_update()
+                    end
+                end,
+            },
         },
     })
 
@@ -1535,6 +1613,12 @@ function BookshelfWidget:onTap()
 end
 
 function BookshelfWidget:onClose()
+    if self.settings_sub_page then
+        self.settings_sub_page = nil
+        self:buildUI()
+        UIManager:setDirty(self, "full")
+        return true
+    end
     UIManager:close(self)
     return true
 end

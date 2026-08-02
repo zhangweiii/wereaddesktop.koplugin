@@ -8,6 +8,7 @@
 #
 # Usage (from the repo root):
 #   sh tools/release.sh            # -> dist/wereaddesktop.koplugin-v<version>.tar.gz
+#   # version may be 0.2.0, 0.2.0-beta.1, or 0.2.0-alpha.1
 #
 # Then create a GitHub release tagged v<version> and attach the tarball.
 

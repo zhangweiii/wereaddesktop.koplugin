@@ -20,11 +20,24 @@ jobs:
         id: version
         run: |
           V=$(sed -n 's/^return "\(.*\)"$/\1/p' wereaddesktop.koplugin/wereaddesktop_version.lua)
+          if [ "${GITHUB_REF_NAME:-}" != "v$V" ]; then
+            echo "tag ${GITHUB_REF_NAME:-<unset>} does not match version v$V" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$V" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta)\.(0|[1-9][0-9]*))?$'; then
+            echo "invalid SemVer: $V" >&2
+            exit 1
+          fi
           echo "value=$V" >> "$GITHUB_OUTPUT"
+          case "$V" in
+            *-alpha.[0-9]*|*-beta.[0-9]*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ steps.version.outputs.value }}
           files: dist/wereaddesktop.koplugin-v${{ steps.version.outputs.value }}.tar.gz
+          prerelease: ${{ steps.version.outputs.prerelease }}
           generate_release_notes: true

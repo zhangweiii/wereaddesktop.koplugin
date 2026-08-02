@@ -79,5 +79,14 @@ echo "同步完成。"
 
 # 弹出设备
 VOL=$(echo "$DEST" | awk -F/ '{print $3}')
-[ -n "$VOL" ] && diskutil eject "/Volumes/$VOL" 2>/dev/null && echo "已弹出 $VOL。" && exit 0
-true
+if [ -n "$VOL" ]; then
+    sync
+    if diskutil eject "/Volumes/$VOL" >/dev/null 2>&1; then
+        echo "已弹出设备：${VOL}。"
+    elif sleep 1 && diskutil eject "/Volumes/$VOL" >/dev/null 2>&1; then
+        echo "已弹出设备：${VOL}。"
+    else
+        echo "同步完成，但未能自动弹出设备：${VOL}，请手动推出。" >&2
+    fi
+fi
+exit 0
