@@ -1,0 +1,23 @@
+{
+    "items": [
+        {
+            "name": "微信读书",
+            "if": "\"KindleVoyage\" -m!",
+            "priority": 0,
+            "action": "/mnt/us/koreader/koreader.sh",
+            "params": "--kual --asap",
+            "status": false,
+            "internal": "status 启动微信读书"
+        },
+        {
+            "name": "微信读书",
+            "if": "\"KindleVoyage\" -m",
+            "priority": 0,
+            "action": "/mnt/us/koreader/koreader.sh",
+            "params": "--kual --asap",
+            "exitmenu": false,
+            "status": false,
+            "internal": "status 启动微信读书"
+        }
+    ]
+}

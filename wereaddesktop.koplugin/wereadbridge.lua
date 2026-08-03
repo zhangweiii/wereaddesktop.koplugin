@@ -24,11 +24,20 @@ local Bridge = {}
 Bridge.__index = Bridge
 
 local SHELF_CACHE_KEY = "wereaddesktop_shelf"
+local SHELF_OWNER_KEY = "wereaddesktop_shelf_user_vid"
 -- Shelf cache key used before the plugin was renamed; migrated on read.
 local LEGACY_SHELF_CACHE_KEY = "kodesktop_shelf"
 local SHELF_FETCHED_AT_KEY = "wereaddesktop_shelf_fetched_at"
 local BACKGROUND_SHELF_TTL = 5 * 60
 local COVER_EXTS = { ".jpg", ".png", ".webp", ".gif" }
+
+local function settings_user_vid(settings)
+    local account = settings:get("account", {})
+    if type(account) == "table" and account.user_vid ~= nil then
+        return tostring(account.user_vid)
+    end
+    return ""
+end
 
 -- Guess an image extension from the file's magic bytes.
 local function sniff_ext(data)
@@ -81,9 +90,61 @@ function Bridge:new(host)
     -- Covers lived under /kodesktop before the rename; move the directory
     -- once so already-downloaded covers survive.
     local data_dir = DataStorage:getFullDataDir()
-    pcall(os.rename, data_dir .. "/kodesktop", data_dir .. "/wereaddesktop")
-    local covers_dir = data_dir .. "/wereaddesktop/covers"
-    ensure_dir(data_dir .. "/wereaddesktop")
+    -- Move pre-rename cover storage once. os.rename refuses to replace a
+    -- non-empty directory, so only attempt it when the target is absent;
+    -- otherwise the legacy directory would linger forever, silently
+    -- (review.md #17).
+    local legacy_dir = data_dir .. "/kodesktop"
+    local new_dir = data_dir .. "/wereaddesktop"
+    local function rename_legacy()
+        local called, renamed, rename_err = pcall(os.rename,
+            legacy_dir, new_dir)
+        if not called or not renamed then
+            logger.warn("legacy cache migration failed:",
+                tostring(called and rename_err or renamed))
+            return false
+        end
+        return true
+    end
+    if lfs.attributes(legacy_dir, "mode") == "directory" then
+        if lfs.attributes(new_dir, "mode") ~= "directory" then
+            rename_legacy()
+        else
+            -- A previous run may have created the new directory while it
+            -- was still empty; replace it so the legacy covers are not
+            -- orphaned forever. A non-empty target is kept (it already
+            -- holds real data; prefer the newer layout).
+            local empty = false
+            local opened, iterator, dir_state = pcall(lfs.dir, new_dir)
+            if opened and type(iterator) == "function" then
+                empty = true
+                for name in iterator, dir_state do
+                    if name ~= "." and name ~= ".." then
+                        empty = false
+                        break
+                    end
+                end
+            else
+                logger.warn("cache target inspection failed:",
+                    tostring(iterator))
+            end
+            if empty then
+                local removed, remove_result, remove_err = pcall(
+                    os.remove, new_dir)
+                if removed and remove_result then
+                    rename_legacy()
+                else
+                    logger.warn("empty cache target removal failed:",
+                        tostring(removed and remove_err or remove_result))
+                end
+            else
+                logger.warn("legacy cache kept because target is non-empty:",
+                    legacy_dir)
+            end
+        end
+    end
+    local covers_dir = new_dir .. "/covers"
+    ensure_dir(new_dir)
     ensure_dir(covers_dir)
     return setmetatable({
         host = host,
@@ -112,6 +173,13 @@ end
 -- credentials were stored, ok=false when the flow is cancelled or fails
 -- (QRLogin itself surfaces detailed errors through the host UI).
 function Bridge:startLogin(on_done)
+    -- Only one QR flow may own the authentication callback. Without this,
+    -- the older flow can finish after logout or a second scan and restore
+    -- credentials the user no longer intended to use.
+    if self.qr_login then
+        self.qr_login:cancel()
+        self.qr_login = nil
+    end
     local qr = QRLogin:new(self.host, self.client, self.settings)
     self.qr_login = qr
     if on_done then
@@ -119,28 +187,77 @@ function Bridge:startLogin(on_done)
         local function fire(ok, err)
             if not fired then
                 fired = true
+                if self.qr_login == qr then
+                    self.qr_login = nil
+                end
                 on_done(ok, err)
             end
         end
         -- Success persists credentials via settings:update_auth; shadow the
-        -- method on this instance to hook that moment.
+        -- method on this instance to hook that moment. The shadow is
+        -- restored from *every* exit path (success or cancel) and only when
+        -- it is still the installed one, so a failed or cancelled login can
+        -- never leave a stale hook that later fires on unrelated
+        -- update_auth calls (e.g. cookie renewal) (review.md #3).
         local settings = self.settings
         local orig_update_auth = settings.update_auth
-        settings.update_auth = function(s, credentials, options)
-            settings.update_auth = orig_update_auth
+        local previous_vid = settings_user_vid(settings)
+        local patched
+        patched = function(s, credentials, options)
+            if settings.update_auth == patched then
+                settings.update_auth = orig_update_auth
+            end
             local result = orig_update_auth(s, credentials, options)
-            fire(true)
+            local current_vid = settings_user_vid(settings)
+            if current_vid ~= previous_vid then
+                settings:set(SHELF_CACHE_KEY, nil)
+                settings:set(SHELF_OWNER_KEY, nil)
+                settings:set(SHELF_FETCHED_AT_KEY, nil)
+                settings:set(LEGACY_SHELF_CACHE_KEY, nil)
+                settings:flush()
+                self:invalidateStorageSummary()
+            end
+            -- Only report success while the flow is still active: an
+            -- offline start or an initial-protocol failure ends the flow
+            -- inside QRLogin:start() (before the cancel wrapper below is
+            -- installed), so the shadow stays installed until the next
+            -- update_auth call — it must never fire the callback then
+            -- (review.md #3).
+            if qr.flow_active then
+                fire(true)
+            end
             return result
         end
+        settings.update_auth = patched
         -- Every abort path (user dismiss, expiry, protocol error) ends in
-        -- cancel(). start() calls cancel() once up front, synchronously,
-        -- so start first and wrap cancel only after it has returned —
-        -- otherwise the up-front cancel consumes the oneshot callback.
-        qr:start()
+        -- cancel(). start() also calls cancel() once up front, synchronously,
+        -- so the wrapper suppresses finalization only during that initial
+        -- reset while remaining installed for every real exit path.
+        local starting = true
         local orig_cancel = qr.cancel
         qr.cancel = function(qr_self)
+            if not starting and settings.update_auth == patched then
+                settings.update_auth = orig_update_auth
+            end
             orig_cancel(qr_self)
-            fire(false, "登录失败或已取消")
+            if not starting then
+                fire(false, "登录失败或已取消")
+            end
+        end
+        local start_ok, start_err = pcall(qr.start, qr)
+        starting = false
+        -- Offline start fails synchronously, before any later cancel callback
+        -- can run. Finalize it here so the shadow method and on_done contract
+        -- are both restored immediately.
+        if not start_ok or not qr.flow_active then
+            if settings.update_auth == patched then
+                settings.update_auth = orig_update_auth
+            end
+            if not start_ok then
+                pcall(orig_cancel, qr)
+                logger.warn("QR login start failed:", tostring(start_err))
+            end
+            fire(false, start_ok and "登录失败或已取消" or tostring(start_err))
         end
     else
         qr:start()
@@ -154,8 +271,9 @@ function Bridge:logout()
     end
     self.settings:reset_account()
     self.settings:set(SHELF_CACHE_KEY, nil)
+    self.settings:set(SHELF_OWNER_KEY, nil)
     self.settings:set(SHELF_FETCHED_AT_KEY, nil)
-    self.settings:set("pending_finish_sync", nil)
+    self.settings:set(LEGACY_SHELF_CACHE_KEY, nil)
     self.settings:flush()
     self:invalidateStorageSummary()
 end
@@ -166,14 +284,30 @@ end
 -- in-memory view since this instance last loaded the file.
 function Bridge:getCachedShelf()
     self.settings:refresh(SHELF_CACHE_KEY)
+    self.settings:refresh(SHELF_OWNER_KEY)
     local cached = self.settings:get(SHELF_CACHE_KEY, nil)
+    local current_vid = settings_user_vid(self.settings)
+    local cached_vid = tostring(self.settings:get(SHELF_OWNER_KEY, "") or "")
     if cached == nil then
         cached = self.settings:get(LEGACY_SHELF_CACHE_KEY, nil)
         if cached ~= nil then
             self.settings:set(SHELF_CACHE_KEY, cached)
+            self.settings:set(SHELF_OWNER_KEY,
+                current_vid ~= "" and current_vid or nil)
             self.settings:set(LEGACY_SHELF_CACHE_KEY, nil)
             self.settings:flush()
         end
+    end
+    if type(cached) == "table" and cached_vid == "" and current_vid ~= "" then
+        -- One-time ownership migration for caches written before this key
+        -- existed. The persisted account and shelf came from the same settings
+        -- file, so binding them here preserves offline use after upgrade.
+        cached_vid = current_vid
+        self.settings:set(SHELF_OWNER_KEY, current_vid)
+        self.settings:flush()
+    end
+    if current_vid == "" or cached_vid ~= current_vid then
+        return nil
     end
     if type(cached) == "table" and #cached > 0 then
         return cached
@@ -183,8 +317,14 @@ end
 
 -- Write back a shelf table mutated after fetching (e.g. cover_path).
 function Bridge:saveShelf(books)
+    local current_vid = settings_user_vid(self.settings)
+    if current_vid == "" then
+        return false
+    end
     self.settings:set(SHELF_CACHE_KEY, books)
+    self.settings:set(SHELF_OWNER_KEY, current_vid)
     self.settings:flush()
+    return true
 end
 
 -- Patch the cached shelf entry after a successful progress upload, so
@@ -235,6 +375,11 @@ end
 function Bridge:invalidateStorageSummary()
     self.storage_summary = nil
     self.storage_summary_at = nil
+    -- The pending-upload summary is derived from the same book records and
+    -- is cached with the same short TTL; drop it alongside (review.md #11).
+    self.pending_summary = nil
+    self.pending_summary_at = nil
+    self.pending_summary_vid = nil
 end
 
 -- Reuse the downloader's reference-counted KOReader + device standby guard
@@ -250,12 +395,24 @@ function Bridge:releaseStandbyGuard()
 end
 
 function Bridge:getPendingUploadSummary()
+    local now = os.time()
+    local current_vid = settings_user_vid(self.settings)
+    if self.pending_summary and self.pending_summary_at
+        and self.pending_summary_vid == current_vid
+        and now - self.pending_summary_at < 10 then
+        return self.pending_summary
+    end
     local count, time_count, elapsed, replay_chunks = 0, 0, 0, 0
     for _, book in pairs(self.settings:get("books", {})) do
         local pending_elapsed = type(book) == "table"
             and (math.max(0, tonumber(book.pending_upload_elapsed) or 0)
                 + math.max(0, tonumber(book.pending_replay_elapsed) or 0)) or 0
+        local book_vid = type(book) == "table"
+            and tostring(book.pending_upload_user_vid or "") or ""
+        -- Ignore pending data queued under another account (review.md #1):
+        -- it is never uploaded, so it must not be shown as actionable.
         if type(book) == "table"
+            and current_vid ~= "" and book_vid == current_vid
             and (type(book.pending_upload_position) == "table"
                 or pending_elapsed > 0) then
             count = count + 1
@@ -266,24 +423,34 @@ function Bridge:getPendingUploadSummary()
             end
         end
     end
-    return {
+    local summary = {
         count = count,
         time_count = time_count,
         elapsed = elapsed,
         replay_chunks = replay_chunks,
     }
+    self.pending_summary = summary
+    self.pending_summary_at = now
+    self.pending_summary_vid = current_vid
+    return summary
 end
 
 -- Discard only queued reading-time deltas. Keep the pending position so the
 -- next automatic reconnect can still sync the user's latest reading place.
 function Bridge:clearPendingUploadElapsed()
     local books = self.settings:get("books", {})
+    local current_vid = settings_user_vid(self.settings)
     local count, elapsed = 0, 0
     for _, book in pairs(type(books) == "table" and books or {}) do
         local pending_elapsed = type(book) == "table"
             and (math.max(0, tonumber(book.pending_upload_elapsed) or 0)
                 + math.max(0, tonumber(book.pending_replay_elapsed) or 0)) or 0
-        if pending_elapsed > 0 then
+        local book_vid = type(book) == "table"
+            and tostring(book.pending_upload_user_vid or "") or ""
+        -- Only clear time belonging to the current account. Foreign and
+        -- legacy-unowned data is hidden from the UI and must remain intact.
+        if pending_elapsed > 0
+            and current_vid ~= "" and book_vid == current_vid then
             count = count + 1
             elapsed = elapsed + pending_elapsed
             book.pending_upload_elapsed = nil
@@ -296,6 +463,7 @@ function Bridge:clearPendingUploadElapsed()
     if count > 0 then
         self.settings:set("books", books)
         self.settings:flush()
+        self:invalidateStorageSummary()
     end
     return count, elapsed
 end
@@ -326,6 +494,14 @@ end
 -- blocking; cb(books|nil, err). Without force_refresh a cached shelf is
 -- returned straight away.
 function Bridge:fetchShelf(force_refresh, cb)
+    -- The account this fetch runs for; compared again right before the
+    -- result is persisted so a mid-fetch account switch can never write
+    -- one account's shelf into the other's cache (review.md #1 follow-up).
+    local fetch_vid = settings_user_vid(self.settings)
+    if fetch_vid == "" then
+        cb(nil, "account_missing")
+        return
+    end
     local cached = self:getCachedShelf()
     if force_refresh == "background" and cached then
         local fetched_at = tonumber(self.settings:get(
@@ -347,6 +523,21 @@ function Bridge:fetchShelf(force_refresh, cb)
     if not ok then
         logger.err("shelf fetch failed:", tostring(result))
         cb(nil, tostring(result))
+        return
+    end
+    -- A business error (HTTP 200 with an errcode payload, or a response
+    -- without the books list) must not be mistaken for an empty shelf and
+    -- persisted over the cached one (review.md #2).
+    local shelf_err_code = type(result) == "table"
+        and (result.errCode or result.errcode) or nil
+    local shelf_failed_succ = type(result) == "table" and result.succ ~= nil
+        and result.succ ~= true and tonumber(result.succ) ~= 1
+    if type(result) ~= "table" or type(result.books) ~= "table"
+        or (shelf_err_code ~= nil and tonumber(shelf_err_code) ~= 0)
+        or shelf_failed_succ then
+        logger.err("shelf sync rejected by server:",
+            "error_code=", tostring(shelf_err_code or "missing_books"))
+        cb(nil, "shelf_sync_business_error")
         return
     end
     -- Keep previously downloaded cover paths and last-known progress
@@ -417,7 +608,19 @@ function Bridge:fetchShelf(force_refresh, cb)
         return (a.last_read_time or a.read_update_time or 0)
             > (b2.last_read_time or b2.read_update_time or 0)
     end)
+    -- Account switch during the fetch: discard instead of persisting this
+    -- account's shelf under the new one.
+    local current_account = self.settings:get("account", {})
+    local current_vid = type(current_account) == "table"
+        and tostring(current_account.user_vid or "") or ""
+    if current_vid ~= fetch_vid then
+        logger.warn("shelf fetch account changed, discarding result:",
+            "fetch_vid=", fetch_vid, "current_vid=", current_vid)
+        cb(nil, "account_changed")
+        return
+    end
     self.settings:set(SHELF_CACHE_KEY, books)
+    self.settings:set(SHELF_OWNER_KEY, current_vid)
     self.settings:set(SHELF_FETCHED_AT_KEY, os.time())
     self.settings:flush()
     cb(books)
@@ -520,12 +723,8 @@ end
 
 -- Account id shown on the settings tab, when known.
 function Bridge:getAccountVid()
-    local account = self.settings:get("account", {})
-    if type(account) == "table" and account.user_vid
-        and tostring(account.user_vid) ~= "" then
-        return tostring(account.user_vid)
-    end
-    return nil
+    local vid = settings_user_vid(self.settings)
+    return vid ~= "" and vid or nil
 end
 
 -- Local cover path for a book_id, if a previous download is still on disk.
@@ -558,10 +757,14 @@ function Bridge:ensureCover(book, cb)
         return
     end
     local ok, result = pcall(function()
-        return self.client:get_binary(book.cover_url)
+        -- Stream with a hard byte cap: an oversized cover aborts the
+        -- transfer instead of being buffered whole (review.md #18/#5).
+        return self.client:get_binary_limited(book.cover_url, 8 * 1024 * 1024)
     end)
     if not ok or type(result) ~= "string" then
-        logger.warn("cover download failed:", tostring(result))
+        logger.warn("cover download failed:",
+            "book_id=", tostring(book.book_id),
+            "error=", tostring(ok and "size_limit_or_error" or result))
         cb(nil)
         return
     end

@@ -46,10 +46,11 @@ jobs:
             spec/test_wifi_state.lua \
             spec/test_single_book_store.lua \
             spec/test_epub_write.lua \
-            spec/test_client_redirects.lua; do
+            spec/test_client_redirects.lua \
+            spec/test_bridge_account_isolation.lua; do
             echo "== $test =="
             luajit "$test"
           done
 
-      - name: Build release archive
+      - name: Build all release packages
         run: sh tools/release.sh

@@ -1,0 +1,2 @@
+# 微读：从 NickelMenu 启动完整 KOReader。
+menu_item :main :微信读书 :cmd_spawn :quiet:/bin/sh /mnt/onboard/.adds/weread/launch.sh

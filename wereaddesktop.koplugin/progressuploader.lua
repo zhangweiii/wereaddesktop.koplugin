@@ -82,6 +82,7 @@ local time_replay = {
     active = false,
     token = 0,
     settings = nil,
+    account_vid = nil,
     block_live_until = 0,
     last_replay_report_at = nil,
 }
@@ -125,6 +126,53 @@ local function response_summary(result)
         table.insert(parts, "message=" .. message)
     end
     return #parts > 0 and table.concat(parts, ",") or "table_without_status"
+end
+
+-- Account (user_vid) the current settings instance is logged in as;
+-- empty when not logged in. Queued offline data is stamped with this so
+-- a later account switch cannot upload it under the new credentials
+-- (review.md #1).
+local function current_user_vid(settings)
+    local account = type(settings.get) == "function"
+        and settings:get("account", {}) or {}
+    if type(account) == "table" and account.user_vid ~= nil then
+        return tostring(account.user_vid)
+    end
+    return ""
+end
+
+local function has_pending_payload(book)
+    return type(book) == "table"
+        and (type(book.pending_upload_position) == "table"
+            or (tonumber(book.pending_upload_elapsed) or 0) > 0
+            or (tonumber(book.pending_replay_elapsed) or 0) > 0)
+end
+
+local function pending_owner_vid(book)
+    return type(book) == "table"
+        and tostring(book.pending_upload_user_vid or "") or ""
+end
+
+local function uploader_account_matches(uploader)
+    local expected = tostring(uploader and uploader.account_vid or "")
+    return expected ~= ""
+        and current_user_vid(uploader.settings) == expected
+end
+
+-- A flat per-book pending record can have only one owner. Unknown legacy
+-- records and records belonging to another account are quarantined: callers
+-- may still upload the current live position, but must not mutate that durable
+-- queue.
+local function can_mutate_pending(book, vid)
+    vid = tostring(vid or "")
+    if vid == "" then
+        return false
+    end
+    local owner = pending_owner_vid(book)
+    if has_pending_payload(book) then
+        return owner == vid
+    end
+    return true
 end
 
 -- Persist one mutated book record. Books live in per-book BookStore files
@@ -175,11 +223,17 @@ function ProgressUploader.beginTimeReplay(settings)
     if time_replay.active then
         return nil, nil, "already_active"
     end
+    local current_vid = current_user_vid(settings)
+    if current_vid == "" then
+        return nil, {}, "account_missing"
+    end
     local prepared = {}
     for uploader in pairs(live_uploaders) do
         if same_settings_scope(uploader.settings, settings)
             and uploader.time_bucket == "pending"
-            and uploader.book_id then
+            and uploader.book_id
+            and uploader.account_vid == current_vid
+            and uploader_account_matches(uploader) then
             local ok, captured = pcall(
                 uploader._prepareTimeReplayBoundary, uploader)
             prepared[uploader] = ok and captured == true
@@ -197,7 +251,12 @@ function ProgressUploader.beginTimeReplay(settings)
             and math.max(0, tonumber(book.pending_upload_elapsed) or 0) or 0
         local replay = type(book) == "table"
             and math.max(0, tonumber(book.pending_replay_elapsed) or 0) or 0
+        local book_vid = type(book) == "table"
+            and tostring(book.pending_upload_user_vid or "") or ""
+        -- Skip time queued under another account: replaying it would credit
+        -- reading time to the currently logged-in account (review.md #1).
         if type(book) == "table"
+            and book_vid == current_vid
             and type(book.pending_upload_position) == "table"
             and pending + replay > 0 then
             book.pending_replay_elapsed = pending + replay
@@ -222,13 +281,16 @@ function ProgressUploader.beginTimeReplay(settings)
     time_replay.token = time_replay.token + 1
     time_replay.active = true
     time_replay.settings = settings
+    time_replay.account_vid = current_vid
     time_replay.last_replay_report_at = nil
     local token = time_replay.token
     local coordination_failed = false
     for uploader in pairs(live_uploaders) do
         if same_settings_scope(uploader.settings, settings)
             and uploader.time_bucket == "pending"
-            and uploader.book_id then
+            and uploader.book_id
+            and uploader.account_vid == current_vid
+            and uploader_account_matches(uploader) then
             local ok, err = pcall(uploader._onTimeReplayStarted, uploader,
                 prepared[uploader] == true)
             if not ok then
@@ -241,6 +303,7 @@ function ProgressUploader.beginTimeReplay(settings)
     if coordination_failed then
         time_replay.active = false
         time_replay.settings = nil
+        time_replay.account_vid = nil
         return nil, ids, "reader_coordination_failed"
     end
     return token, ids
@@ -255,10 +318,13 @@ function ProgressUploader.endTimeReplay(token, _at)
         return false
     end
     local settings = time_replay.settings
+    local account_vid = time_replay.account_vid
     for uploader in pairs(live_uploaders) do
         if same_settings_scope(uploader.settings, settings)
             and uploader.time_bucket == "pending"
-            and uploader.book_id then
+            and uploader.book_id
+            and uploader.account_vid == account_vid
+            and uploader_account_matches(uploader) then
             local ok, err = pcall(uploader._onTimeReplayFinishing, uploader)
             if not ok then
                 logger.warn("live replay finish coordination failed:",
@@ -269,6 +335,7 @@ function ProgressUploader.endTimeReplay(token, _at)
     local last_report_at = tonumber(time_replay.last_replay_report_at)
     time_replay.active = false
     time_replay.settings = nil
+    time_replay.account_vid = nil
     if last_report_at then
         time_replay.block_live_until = math.max(
             tonumber(time_replay.block_live_until) or 0,
@@ -311,6 +378,11 @@ function ProgressUploader:new(options)
         settings = options.settings,
         client = options.client,
         scheduler = options.scheduler,
+        -- Every scheduled callback is bound to this account. It is refreshed
+        -- only when a new document session starts; retries keep the original
+        -- owner so an account switch cannot change credentials underneath an
+        -- in-flight upload.
+        account_vid = current_user_vid(options.settings),
         -- Returns the current reading position as a 0..1 fraction.
         get_fraction = options.get_fraction,
         -- Chapter-coordinate mapping (preferred over the fraction): the
@@ -354,6 +426,10 @@ end
 
 function ProgressUploader:_timeFields()
     return TIME_BUCKETS[self.time_bucket] or TIME_BUCKETS.pending
+end
+
+function ProgressUploader:_accountMatches()
+    return uploader_account_matches(self)
 end
 
 -- Internal cumulative active time for the current document session.
@@ -458,10 +534,22 @@ function ProgressUploader:_persistPending(position, reason, elapsed, force)
     if type(book) ~= "table" then
         return false
     end
+    if not self:_accountMatches()
+        or not can_mutate_pending(book, self.account_vid) then
+        logger.warn("pending progress is quarantined for another/unknown account:",
+            "book=", tostring(self.book_id),
+            "owner=", pending_owner_vid(book),
+            "current=", current_user_vid(self.settings))
+        return false
+    end
     self.pending_position = copy_position(position)
     self.pending_reason = reason or self.pending_reason or "unknown"
     book.pending_upload_position = copy_position(self.pending_position)
     book.pending_upload_reason = self.pending_reason
+    -- Stamp the owning account, but never overwrite a marker that belongs
+    -- to another account: that would reattribute queued offline data to
+    -- the currently logged-in user (review.md #1 follow-up).
+    book.pending_upload_user_vid = self.account_vid
     local fields = self:_timeFields()
     -- `pending_elapsed` in memory is the backlog from previous sessions;
     -- the current session's unreported time is derived from the clock. The
@@ -505,6 +593,10 @@ function ProgressUploader:_clearPending()
     if type(book) ~= "table" then
         return false
     end
+    if not self:_accountMatches()
+        or pending_owner_vid(book) ~= self.account_vid then
+        return false
+    end
     local fields = self:_timeFields()
     book[fields.elapsed] = nil
     book[fields.started_at] = nil
@@ -515,6 +607,7 @@ function ProgressUploader:_clearPending()
         book.pending_upload_position = nil
         book.pending_upload_reason = nil
         book.pending_upload_updated_at = nil
+        book.pending_upload_user_vid = nil
     else
         book.pending_upload_updated_at = self.now()
     end
@@ -533,6 +626,17 @@ function ProgressUploader:_restorePending()
     local book = self.settings:get_book(self.book_id)
     if type(book) ~= "table"
         or type(book.pending_upload_position) ~= "table" then
+        return false
+    end
+    -- Offline data queued under another account must never be resumed and
+    -- uploaded with the current credentials; leave the record (and its
+    -- marker) untouched so the previous owner's queue is preserved
+    -- (review.md #1 follow-up).
+    local vid = current_user_vid(self.settings)
+    local book_vid = pending_owner_vid(book)
+    if vid == "" or vid ~= self.account_vid or book_vid ~= vid then
+        logger.warn("pending progress belongs to another account, not resumed:",
+            "book=", tostring(self.book_id))
         return false
     end
     self.pending_position = copy_position(book.pending_upload_position)
@@ -610,6 +714,7 @@ function ProgressUploader:onReaderReady(path)
     self.defer_pending_time = false
     self._pulled_ahead = false
     self.opened_at = self.now()
+    self.account_vid = current_user_vid(self.settings)
     local book_id = self:detectBook(path)
     if not book_id or WeRead.is_mp_book(book_id) then
         logger.dbg("reader open ignored:", "path=", tostring(path),
@@ -625,7 +730,8 @@ function ProgressUploader:onReaderReady(path)
     -- and is uploaded before a later clean open may pull cloud progress.
     local generation = self.generation
     self.scheduler:scheduleIn(OPEN_REPORT_DELAY, function()
-        if generation ~= self.generation or not self.book_id then
+        if generation ~= self.generation or not self.book_id
+            or not self:_accountMatches() then
             return
         end
         -- A durable local position has not reached the cloud yet and is the
@@ -658,7 +764,7 @@ end
 -- include_pending_time and drains RT_CAP-sized chunks at the paced interval.
 function ProgressUploader:retryPending(book_id, options)
     options = options or {}
-    if self.uploading or not self.is_online() then
+    if self.uploading or not self.is_online() or not self:_accountMatches() then
         return false
     end
     if self.book_id then
@@ -683,7 +789,8 @@ function ProgressUploader:retryPending(book_id, options)
     book_id = tostring(book_id or "")
     local book = self.settings:get_book(book_id)
     if book_id == "" or type(book) ~= "table"
-        or type(book.pending_upload_position) ~= "table" then
+        or type(book.pending_upload_position) ~= "table"
+        or pending_owner_vid(book) ~= self.account_vid then
         return false
     end
     self.generation = self.generation + 1
@@ -721,7 +828,8 @@ end
 -- record it; the timer is what reports position and reading time), then
 -- re-arm. Stops when the document changes.
 function ProgressUploader:_heartbeat(generation)
-    if generation ~= self.generation or not self.book_id or self.closing then
+    if generation ~= self.generation or not self.book_id or self.closing
+        or not self:_accountMatches() then
         logger.dbg("heartbeat stopped:", "scheduled_generation=", tostring(generation),
             "current_generation=", tostring(self.generation),
             "book=", tostring(self.book_id),
@@ -1115,6 +1223,28 @@ function ProgressUploader:_finishClose(generation)
     end
 end
 
+-- Cancel a headless close/replay worker while keeping its durable queue. The
+-- scheduler cannot remove an already queued task, so invalidate its
+-- generation first; the next task will be ignored and the owner can release
+-- its standby guard from on_finished.
+function ProgressUploader:cancel(reason)
+    if not self.book_id then
+        return false
+    end
+    local position = self.close_position or self.pending_position
+        or self.last_position
+    self.generation = self.generation + 1
+    self.uploading = false
+    self.closing = true
+    self.close_position = position and copy_position(position) or nil
+    if position then
+        self:_persistPending(position, reason or "cancelled",
+            self:_unreportedElapsed(), true)
+    end
+    self:_finishClose(self.generation)
+    return true
+end
+
 -- ReaderUI CloseDocument event: freeze active time, stop heartbeats and keep
 -- the session alive until the final upload (including retries) completes.
 function ProgressUploader:onCloseDocument(fraction)
@@ -1162,18 +1292,40 @@ end
 -- rt. Keep a closed-book backlog durable and replay at real-time speed; firing
 -- the chunks back-to-back silently loses every chunk after the first.
 function ProgressUploader:_scheduleBacklogReplay(position, generation, options)
+    local scheduled_at = tonumber(self.now()) or 0
     logger.info("backlog replay scheduled:",
         "book=", tostring(position and position.book_id),
         "delay_s=", tostring(BACKLOG_REPLAY_DELAY),
         "remaining_s=", tostring(self:_unreportedElapsed()))
     self.scheduler:scheduleIn(BACKLOG_REPLAY_DELAY, function()
-        if generation ~= self.generation or not self.closing then
-            return
-        end
-        if not self:_upload(position, "backlog_replay", nil, options) then
-            -- Offline/final failure leaves the durable record intact. Release
-            -- this headless uploader so the next network event can restore it.
-            self:_finishClose(generation)
+        local ok, err = xpcall(function()
+            local late_s = math.max(0,
+                (tonumber(self.now()) or scheduled_at)
+                    - scheduled_at - BACKLOG_REPLAY_DELAY)
+            if late_s >= 5 then
+                logger.warn("backlog replay task late:",
+                    "book=", tostring(position and position.book_id),
+                    "late_s=", tostring(late_s))
+            end
+            if generation ~= self.generation or not self.closing then
+                return
+            end
+            if not self:_upload(position, "backlog_replay", nil, options) then
+                -- Offline/final failure leaves the durable record intact. Release
+                -- this headless uploader so the next network event can restore it.
+                self:_finishClose(generation)
+            end
+        end, debug.traceback)
+        if not ok then
+            self.uploading = false
+            logger.err("backlog replay task failed:",
+                "book=", tostring(position and position.book_id),
+                "error=", tostring(err))
+            if generation == self.generation and self.closing then
+                self:_persistPending(position, "backlog_replay",
+                    self:_unreportedElapsed(), true)
+                self:_finishClose(generation)
+            end
         end
     end)
 end
@@ -1184,6 +1336,13 @@ end
 -- the document changes underneath a scheduled task.
 function ProgressUploader:_upload(position, reason, attempt, options)
     options = options or {}
+    if not self:_accountMatches() then
+        logger.warn("upload skipped after account change:",
+            "book=", tostring(position and position.book_id),
+            "expected=", tostring(self.account_vid),
+            "current=", current_user_vid(self.settings))
+        return false
+    end
     if self.time_bucket == "replay" and self.book_id then
         -- A live reader may have advanced the book while this worker waited
         -- for the next 61-second slot. Carry its newest position instead of
@@ -1230,8 +1389,25 @@ function ProgressUploader:_upload(position, reason, attempt, options)
         upload_delay = math.max(upload_delay,
             ProgressUploader.timeReplayStartDelay(self.now()))
     end
+    local scheduled_at = tonumber(self.now()) or 0
     self.scheduler:scheduleIn(upload_delay, function()
+        local late_s = math.max(0,
+            (tonumber(self.now()) or scheduled_at)
+                - scheduled_at - upload_delay)
+        if late_s >= 5 then
+            logger.warn("upload task late:",
+                "book=", tostring(position.book_id),
+                "reason=", tostring(reason),
+                "late_s=", tostring(late_s))
+        end
         if generation ~= self.generation then
+            return
+        end
+        if not self:_accountMatches() then
+            self.uploading = false
+            if self.closing then
+                self:_finishClose(generation)
+            end
             return
         end
         if not self.is_online() then
@@ -1287,7 +1463,8 @@ function ProgressUploader:_upload(position, reason, attempt, options)
             return
         end
         if ok and not err then
-            self.uploading = false
+            local handled, handling_error = xpcall(function()
+                self.uploading = false
             local pending_sent = sending_pending
                 and math.min(pending_before, elapsed) or 0
             local session_sent = elapsed - pending_sent
@@ -1354,6 +1531,24 @@ function ProgressUploader:_upload(position, reason, attempt, options)
                     end
                 end
                 self:_finishClose(generation)
+                end
+            end, debug.traceback)
+            if not handled then
+                self.uploading = false
+                logger.err("progress upload bookkeeping failed:",
+                    "book=", tostring(position.book_id),
+                    "reason=", tostring(reason),
+                    "error=", tostring(handling_error))
+                local recovery_position = self.close_position
+                    or self.pending_position or position
+                if recovery_position then
+                    self:_persistPending(recovery_position,
+                        self.pending_reason or reason,
+                        self:_unreportedElapsed(), true)
+                end
+                if self.closing then
+                    self:_finishClose(generation)
+                end
             end
             return
         end
@@ -1366,6 +1561,12 @@ function ProgressUploader:_upload(position, reason, attempt, options)
                     return
                 end
                 self.uploading = false
+                if not self:_accountMatches() then
+                    if self.closing then
+                        self:_finishClose(generation)
+                    end
+                    return
+                end
                 self:_upload(position, "retry", attempt + 1, options)
             end)
         else
@@ -1395,6 +1596,9 @@ end
 -- stored web-session tokens are rejected, refresh the reader state once
 -- and retry before giving up. Returns nil on success, error otherwise.
 function ProgressUploader:_send(position, elapsed, reason, attempt)
+    if not self:_accountMatches() then
+        return "account_changed"
+    end
     local book_id = position.book_id
     local book = self.settings:get_book(book_id)
     if type(book) ~= "table" then
@@ -1509,11 +1713,27 @@ function ProgressUploader:_persistUploadResult(position, pending_position,
     book.last_upload_at = now
     local elapsed = math.max(0, tonumber(pending_elapsed) or 0)
     local fields = self:_timeFields()
+    local may_mutate_pending = self:_accountMatches()
+        and can_mutate_pending(book, self.account_vid)
+    if not may_mutate_pending then
+        -- Keep the other/unknown owner's durable queue byte-for-byte intact.
+        -- The accepted live position above is still safe to persist locally.
+        logger.warn("upload result left quarantined pending data untouched:",
+            "book=", tostring(position.book_id),
+            "owner=", pending_owner_vid(book),
+            "current=", current_user_vid(self.settings))
+        self.settings:save_book(tostring(position.book_id), book)
+        self.settings:flush()
+        return
+    end
     if pending_position then
         self.pending_position = copy_position(pending_position)
         self.pending_reason = pending_reason or self.pending_reason or "unknown"
         book.pending_upload_position = copy_position(self.pending_position)
         book.pending_upload_reason = self.pending_reason
+        -- Never overwrite another account's ownership marker (see
+        -- _persistPending; review.md #1 follow-up).
+        book.pending_upload_user_vid = self.account_vid
         book[fields.elapsed] = elapsed > 0 and elapsed or nil
         if elapsed > 0 then
             if not self.is_online() then
@@ -1545,6 +1765,7 @@ function ProgressUploader:_persistUploadResult(position, pending_position,
             book.pending_upload_position = nil
             book.pending_upload_reason = nil
             book.pending_upload_updated_at = nil
+            book.pending_upload_user_vid = nil
         else
             book.pending_upload_updated_at = now
         end

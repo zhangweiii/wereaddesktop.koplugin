@@ -21,6 +21,7 @@ local reading_fields = {
     pclts = true,
     pending_upload_position = true,
     pending_upload_reason = true,
+    pending_upload_user_vid = true,
     pending_upload_elapsed = true,
     pending_upload_started_at = true,
     pending_upload_updated_at = true,

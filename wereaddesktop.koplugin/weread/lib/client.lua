@@ -424,6 +424,47 @@ function Client:get_binary(url, opts)
     error(http_error(self, code, text, resp_headers))
 end
 
+-- Like get_binary, but streams through a byte-counting sink and aborts
+-- the transfer as soon as the response exceeds max_bytes, so a
+-- pathological response is never buffered whole in memory
+-- (review.md #18 follow-up). Returns nil, code, headers,
+-- "max_bytes_exceeded" when the cap was hit.
+function Client:get_binary_limited(url, max_bytes, opts)
+    opts = opts or {}
+    max_bytes = math.max(1, tonumber(max_bytes) or 1)
+    local chunks = {}
+    local received = 0
+    local overflow = false
+    local function sink(chunk)
+        if chunk == nil then
+            return 1
+        end
+        received = received + #chunk
+        if received > max_bytes then
+            overflow = true
+            return nil -- abort the transfer
+        end
+        chunks[#chunks + 1] = chunk
+        return 1
+    end
+    local text, code, resp_headers = self:request_follow(merge_req_opts(opts, {
+        url = url,
+        method = "GET",
+        sink = sink,
+        headers = {
+            ["Accept"] = header_value(opts.headers, "Accept") or opts.accept or "*/*",
+            ["Referer"] = header_value(opts.headers, "Referer") or opts.referer or "https://weread.qq.com/",
+        },
+    }))
+    if overflow then
+        return nil, code, resp_headers, "max_bytes_exceeded"
+    end
+    if code and code >= 200 and code < 300 then
+        return table.concat(chunks), code, resp_headers
+    end
+    error(http_error(self, code, text, resp_headers))
+end
+
 function Client:renew_cookie()
     local result, code, resp_headers = self:post_json("https://weread.qq.com/web/login/renewal", {
         rq = "%2Fweb%2Fbook%2Fread",
@@ -634,6 +675,22 @@ function Client:get_shelf_progress()
     if not ok then
         logger.err("shelf progress failed:", "error=", log_error(result))
         return nil, tostring(result)
+    end
+    if type(result) ~= "table" then
+        logger.err("shelf progress failed:", "error=non-table response")
+        return nil, "shelf_progress_invalid_response"
+    end
+    -- A business error with HTTP 200 (errcode / failed succ) must not be
+    -- interpreted as "no progress anywhere": the caller then keeps the
+    -- cached values instead of resetting the whole shelf to 0
+    -- (review.md #2).
+    local err_code = result.errCode or result.errcode
+    local failed_succ = result.succ ~= nil
+        and result.succ ~= true and tonumber(result.succ) ~= 1
+    if (err_code ~= nil and tonumber(err_code) ~= 0) or failed_succ then
+        logger.warn("shelf progress rejected by server:",
+            "error_code=", tostring(err_code))
+        return nil, "shelf_progress_business_error"
     end
     local map = {}
     for _, item in ipairs(type(result) == "table" and result.bookProgress or {}) do

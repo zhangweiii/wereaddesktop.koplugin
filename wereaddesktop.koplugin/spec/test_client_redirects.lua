@@ -33,6 +33,15 @@ package.preload["socket.http"] = function()
                 url = req_opts.url,
                 headers = req_opts.headers,
             }
+            if req_opts.url:find("limited", 1, true) then
+                for _, chunk in ipairs({ "1234", "5678" }) do
+                    if not req_opts.sink(chunk) then
+                        return nil, "sink stopped", {}, "sink stopped"
+                    end
+                end
+                req_opts.sink(nil)
+                return 1, 200, {}, "200 OK"
+            end
             local redirect = req_opts.url:find("redirect", 1, true) ~= nil
             if redirect then
                 return nil, 302, { Location = recorded.redirect_target },
@@ -141,6 +150,19 @@ check("same-origin redirect keeps credentials",
         and has_credential_headers(recorded[2].headers) == true
         and recorded[2].headers["Referer"]
             == "https://weread.qq.com/web/reader/book1")
+
+----------------------------------------------------------------
+-- Limited binary downloads stop at the sink instead of buffering an
+-- arbitrarily large response.
+----------------------------------------------------------------
+local limited = client:get_binary_limited(
+    "https://cdn.example.com/limited", 8)
+check("limited binary download returns content within the cap",
+    limited == "12345678")
+local oversized, _code, _headers, limit_err = client:get_binary_limited(
+    "https://cdn.example.com/limited", 7)
+check("limited binary download aborts content above the cap",
+    oversized == nil and limit_err == "max_bytes_exceeded")
 
 if failures > 0 then
     print(failures .. " check(s) FAILED")

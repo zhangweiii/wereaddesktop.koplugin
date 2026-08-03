@@ -60,7 +60,7 @@ else
     cp "$selected" "$SERVE_ROOT/u.tar.gz"
     echo "短地址（指向最近生成的包）：http://${IP:-电脑IP}:$PORT/u.tar.gz"
 fi
-echo "保持此窗口运行，在 Kindle 的高级升级中输入上面的升级包地址。"
+echo "保持此窗口运行，在设备的微读高级升级中输入上面的升级包地址。"
 echo "按 Ctrl-C 停止服务。"
 
 python3 -m http.server "$PORT" --bind 0.0.0.0 --directory "$SERVE_ROOT"

@@ -74,10 +74,19 @@ local function networkState()
     return wifi_on, connected, NetworkMgr
 end
 
+-- The vendored WeRead protocol layer salts its signatures with
+-- math.random (protocol.lua ts/rn fields). Seed exactly once per
+-- process: both the file-manager and reader contexts run init(), and a
+-- second math.randomseed(os.time()) would reset the shared PRNG stream
+-- to the same point (same-second init), making the ts/rn signature
+-- fields predictable and duplicable across the two instances.
+local random_seeded = false
+
 function WeReadDesktop:init()
-    -- The vendored WeRead protocol layer salts its signatures with
-    -- math.random (protocol.lua ts/rn fields).
-    math.randomseed(os.time())
+    if not random_seeded then
+        random_seeded = true
+        math.randomseed(os.time())
+    end
     migrateSettings()
     -- In the reader context only the WeRead progress upload runs; the
     -- desktop itself (and its menu/callbacks) stays file-manager-only.
@@ -279,6 +288,14 @@ end
 ----------------------------------------------------------------
 
 local PENDING_FINISH_SYNC_KEY = "pending_finish_sync"
+
+local function settingsAccountVid(settings)
+    local account = settings and settings:get("account", {}) or {}
+    if type(account) == "table" and account.user_vid ~= nil then
+        return tostring(account.user_vid)
+    end
+    return ""
+end
 
 -- Reader-context setup: build a dedicated bridge (settings + client,
 -- no UI) and the two-way progress sync.
@@ -545,12 +562,27 @@ function WeReadDesktop:onLocalFinishedStatus(finished)
     if type(pending) ~= "table" then
         pending = {}
     end
-    local account = settings:get("account", {})
+    local current_vid = settingsAccountVid(settings)
+    if current_vid == "" then
+        logger.warn("wereaddesktop: finished status not queued without account:",
+            "book_id=", book_id)
+        self:showTransientInfo(
+            _("已在本地标记；登录后再次修改状态即可同步。"), 3)
+        return true
+    end
+    local existing = pending[book_id]
+    if type(existing) == "table"
+        and tostring(existing.user_vid or "") ~= current_vid then
+        logger.warn("wereaddesktop: finished status queue is owned by another"
+            .. "/unknown account:", "book_id=", book_id)
+        self:showTransientInfo(
+            _("已在本地标记；另一账号仍有待同步状态，本次不覆盖。"), 3)
+        return true
+    end
     pending[book_id] = {
         finished = finished,
         updated_at = os.time(),
-        user_vid = type(account) == "table"
-            and tostring(account.user_vid or "") or "",
+        user_vid = current_vid,
     }
     self:savePendingFinishedStatus(settings, pending)
     logger.info("wereaddesktop: queued finished status:",
@@ -590,9 +622,10 @@ function WeReadDesktop:syncPendingFinishedStatus(book_id)
     if type(pending) ~= "table" then
         return false
     end
-    local current_account = settings:get("account", {})
-    local current_vid = type(current_account) == "table"
-        and tostring(current_account.user_vid or "") or ""
+    local current_vid = settingsAccountVid(settings)
+    if current_vid == "" then
+        return false
+    end
     local ids = {}
     if book_id ~= nil then
         ids[1] = tostring(book_id)
@@ -608,17 +641,24 @@ function WeReadDesktop:syncPendingFinishedStatus(book_id)
         if type(entry) == "table"
             and not self.finished_status_requests[pending_book_id] then
             local queued_vid = tostring(entry.user_vid or "")
-            if queued_vid ~= "" and current_vid ~= ""
-                and queued_vid ~= current_vid then
-                pending[pending_book_id] = nil
-                self:savePendingFinishedStatus(settings, pending)
-                logger.warn("wereaddesktop: discarded finished status for"
-                    .. " another account:", "book_id=", pending_book_id)
+            if queued_vid ~= current_vid then
+                -- Preserve foreign and legacy-unowned entries. They are not
+                -- actionable for this account, but deleting them here would
+                -- destroy the previous owner's offline state.
+                logger.warn("wereaddesktop: skipped finished status for"
+                    .. " another/unknown account:",
+                    "book_id=", pending_book_id)
             else
                 scheduled = true
                 self.finished_status_requests[pending_book_id] = true
                 local target_finished = entry.finished == true
                 UIManager:scheduleIn(0.1, function()
+                    if settingsAccountVid(settings) ~= current_vid then
+                        self.finished_status_requests[pending_book_id] = nil
+                        logger.warn("wereaddesktop: finished status skipped after"
+                            .. " account change:", "book_id=", pending_book_id)
+                        return
+                    end
                     local call_ok, ok, _result, err = pcall(
                         bridge.client.mark_book_finished,
                         bridge.client,
@@ -635,7 +675,8 @@ function WeReadDesktop:syncPendingFinishedStatus(book_id)
                         local current = type(latest) == "table"
                             and latest[pending_book_id] or nil
                         if type(current) == "table"
-                            and current.finished == target_finished then
+                            and current.finished == target_finished
+                            and tostring(current.user_vid or "") == current_vid then
                             latest[pending_book_id] = nil
                             self:savePendingFinishedStatus(settings, latest)
                             if type(bridge.updateShelfFinished) == "function" then
@@ -1178,11 +1219,23 @@ function WeReadDesktop:syncPendingReadingProgress(options)
         settings:refresh("books")
     end
     local books = settings:get("books", {})
+    local current_vid = settingsAccountVid(settings)
+    if current_vid == "" then
+        return false
+    end
     local ids = {}
     for book_id, book in pairs(type(books) == "table" and books or {}) do
         if type(book) == "table"
             and type(book.pending_upload_position) == "table" then
-            ids[#ids + 1] = tostring(book_id)
+            local book_vid = tostring(book.pending_upload_user_vid or "")
+            if book_vid ~= current_vid then
+                -- Offline data queued under another account must never be
+                -- uploaded with this account's credentials (review.md #1).
+                logger.warn("wereaddesktop: skipped pending progress for"
+                    .. " another account:", "book_id=", tostring(book_id))
+            else
+                ids[#ids + 1] = tostring(book_id)
+            end
         end
     end
     table.sort(ids)
@@ -1233,6 +1286,52 @@ end
 -- parallel book queues would otherwise make the server credit only one. The
 -- coordinator snapshots the backlog at start, while time read during this run
 -- stays in the normal pending bucket for a later pass.
+local function formatDuration(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    local remain = seconds % 60
+    if hours > 0 then
+        if minutes > 0 then
+            return string.format(_("%d小时%d分钟"), hours, minutes)
+        end
+        return string.format(_("%d小时"), hours)
+    end
+    if minutes > 0 then
+        return string.format(_("%d分钟"), minutes)
+    end
+    return string.format(_("%d秒"), remain)
+end
+
+function WeReadDesktop:cancelPendingReadingTimeUpload(message)
+    local cancel = self.pending_time_upload_cancel
+    if type(cancel) ~= "function" then
+        return false
+    end
+    return cancel(message)
+end
+
+-- Stop every uploader that captured the current credentials before an
+-- explicit logout/re-login changes them. Durable queues are persisted first;
+-- already-scheduled callbacks are invalidated by each uploader's generation.
+function WeReadDesktop:cancelAccountBoundUploads(message)
+    self:cancelPendingReadingTimeUpload(message)
+    local uploaders = {}
+    for _book_id, uploader in pairs(self.pending_progress_uploaders or {}) do
+        uploaders[#uploaders + 1] = uploader
+    end
+    for _, uploader in ipairs(uploaders) do
+        if uploader and type(uploader.cancel) == "function" then
+            pcall(uploader.cancel, uploader, "account_change")
+        end
+    end
+    self.pending_progress_uploaders = {}
+    local live = self.progress_uploader
+    if live and live.book_id and type(live.cancel) == "function" then
+        pcall(live.cancel, live, "account_change")
+    end
+end
+
 function WeReadDesktop:startPendingReadingTimeUpload()
     if self.pending_time_upload_active then
         self:showTransientInfo(_("离线阅读时长正在上报中"), 2)
@@ -1247,6 +1346,19 @@ function WeReadDesktop:startPendingReadingTimeUpload()
         or not bridge.isLoggedIn or not bridge:isLoggedIn() then
         self:showInfo(_("无法上报：请先登录微信读书。"))
         return false
+    end
+    local replay_vid = settingsAccountVid(bridge.settings)
+    if replay_vid == "" then
+        self:showInfo(_("无法上报：当前登录缺少账号标识。"))
+        return false
+    end
+    local replay_total = 1
+    if type(bridge.getPendingUploadSummary) == "function" then
+        local summary_ok, summary = pcall(
+            bridge.getPendingUploadSummary, bridge)
+        if summary_ok and type(summary) == "table" then
+            replay_total = math.max(1, tonumber(summary.elapsed) or 0)
+        end
     end
     local begin_ok, replay_token, ids, begin_err = pcall(
         ProgressUploader.beginTimeReplay, bridge.settings)
@@ -1272,6 +1384,10 @@ function WeReadDesktop:startPendingReadingTimeUpload()
     self.pending_time_upload_active = true
     self.pending_time_upload_queue = ids
     self.pending_time_upload_token = replay_token
+    self.pending_time_upload_total = replay_total
+    self.pending_time_upload_account_vid = replay_vid
+    self.pending_time_upload_uploader = nil
+    self.pending_time_upload_dialog = nil
     local standby_held = false
     if type(bridge.acquireStandbyGuard) == "function" then
         local ok, err = pcall(bridge.acquireStandbyGuard, bridge)
@@ -1282,6 +1398,35 @@ function WeReadDesktop:startPendingReadingTimeUpload()
         end
     end
     local finished = false
+    local dialog
+    local function replayRemaining()
+        local ok, books = pcall(bridge.settings.get, bridge.settings,
+            "books", {})
+        if not ok or type(books) ~= "table" then
+            return replay_total
+        end
+        local remaining = 0
+        for _, book in pairs(books) do
+            if type(book) == "table"
+                and tostring(book.pending_upload_user_vid or "") == replay_vid then
+                remaining = remaining + math.max(0,
+                    tonumber(book.pending_replay_elapsed) or 0)
+            end
+        end
+        return remaining
+    end
+    local function updateDialog()
+        if not dialog then
+            return
+        end
+        local remaining = replayRemaining()
+        local completed = math.max(0, replay_total - remaining)
+        pcall(dialog.reportProgress, dialog,
+            math.min(replay_total, completed))
+        pcall(dialog.setTitle, dialog, string.format(
+            _("正在上报离线阅读时长：已处理 %s，剩余 %s"),
+            formatDuration(completed), formatDuration(remaining)))
+    end
     local function finish(message, completed)
         if finished then
             return
@@ -1290,6 +1435,15 @@ function WeReadDesktop:startPendingReadingTimeUpload()
         self.pending_time_upload_active = false
         self.pending_time_upload_queue = nil
         self.pending_time_upload_token = nil
+        self.pending_time_upload_uploader = nil
+        self.pending_time_upload_cancel = nil
+        self.pending_time_upload_total = nil
+        self.pending_time_upload_account_vid = nil
+        if dialog then
+            pcall(dialog.close, dialog)
+            dialog = nil
+        end
+        self.pending_time_upload_dialog = nil
         local end_ok, ended = pcall(
             ProgressUploader.endTimeReplay, replay_token, os.time())
         if not end_ok or not ended then
@@ -1302,18 +1456,34 @@ function WeReadDesktop:startPendingReadingTimeUpload()
         end
         self:refreshDesktop()
         if completed then
-            local remaining = bridge:getPendingUploadSummary()
-            if (tonumber(remaining.elapsed) or 0) > 0 then
+            local remaining_ok, remaining = pcall(
+                bridge.getPendingUploadSummary, bridge)
+            if remaining_ok and type(remaining) == "table"
+                and (tonumber(remaining.elapsed) or 0) > 0 then
                 message = string.format(
                     _("本轮离线时长已上报；阅读期间新增时长已保留，可稍后继续（%s）"),
                     self:syncStatusLabel(remaining))
-            else
+            elseif remaining_ok then
                 message = _("离线阅读时长已全部上报")
             end
         end
         if message then
             self:showTransientInfo(message, 3)
         end
+    end
+    self.pending_time_upload_cancel = function(message)
+        if finished then
+            return false
+        end
+        -- Mark the run inactive before invalidating the worker. Its
+        -- on_finished callback may run synchronously from cancel().
+        self.pending_time_upload_active = false
+        local uploader = self.pending_time_upload_uploader
+        if uploader and type(uploader.cancel) == "function" then
+            pcall(uploader.cancel, uploader, "manual_replay_cancelled")
+        end
+        finish(message)
+        return true
     end
     local uploadNext
     local function runUploadNext()
@@ -1330,6 +1500,10 @@ function WeReadDesktop:startPendingReadingTimeUpload()
         end
         if not self:isNetworkConnected() then
             finish(_("离线阅读时长上报已暂停，联网后可继续"))
+            return
+        end
+        if settingsAccountVid(bridge.settings) ~= replay_vid then
+            finish(_("账号已变化，离线阅读时长上报已暂停"))
             return
         end
         local book_id = table.remove(self.pending_time_upload_queue, 1)
@@ -1352,9 +1526,17 @@ function WeReadDesktop:startPendingReadingTimeUpload()
                     bridge:updateShelfProgress(uploaded_book_id,
                         position and position.fraction)
                 end
+                updateDialog()
             end,
             on_finished = function()
+                if not self.pending_time_upload_active then
+                    return
+                end
                 local ok, err = xpcall(function()
+                    if settingsAccountVid(bridge.settings) ~= replay_vid then
+                        finish(_("账号已变化，离线阅读时长上报已暂停"))
+                        return
+                    end
                     local current = bridge.settings:get_book(book_id)
                     if type(current) == "table"
                         and (tonumber(current.pending_replay_elapsed) or 0) > 0 then
@@ -1363,6 +1545,10 @@ function WeReadDesktop:startPendingReadingTimeUpload()
                     end
                     if #self.pending_time_upload_queue > 0 then
                         pcall(self.refreshDesktop, self)
+                        if dialog then
+                            pcall(dialog.setTitle, dialog,
+                                _("正在等待下一段上报…"))
+                        end
                         UIManager:scheduleIn(61, runUploadNext)
                     else
                         finish(nil, true)
@@ -1375,6 +1561,7 @@ function WeReadDesktop:startPendingReadingTimeUpload()
                 end
             end,
         }
+        self.pending_time_upload_uploader = uploader
         local ok, started = pcall(uploader.retryPending, uploader, book_id,
             { include_pending_time = true })
         if not ok then
@@ -1383,6 +1570,44 @@ function WeReadDesktop:startPendingReadingTimeUpload()
         end
         if not ok or not started then
             finish(_("离线阅读时长上报未能启动，可稍后重试"))
+        end
+    end
+    local dialog_ok, DownloadDialog = pcall(
+        require, "weread.ui.download_dialog")
+    if dialog_ok then
+        local created_ok, created = pcall(function()
+            return DownloadDialog:new{
+                title = string.format(
+                    _("正在上报离线阅读时长：已处理 0，剩余 %s"),
+                    formatDuration(replay_total)),
+                progress_max = replay_total,
+                buttons = {{
+                    {
+                        text = _("停止上报"),
+                        callback = function()
+                            self:cancelPendingReadingTimeUpload(
+                                _("离线阅读时长上报已停止，可稍后继续"))
+                        end,
+                    },
+                }},
+            }
+        end)
+        if created_ok then
+            dialog = created
+            self.pending_time_upload_dialog = dialog
+            local shown_ok, shown_err = pcall(dialog.show, dialog,
+                function(widget, refresh_mode)
+                    self:showOverlay(widget, refresh_mode)
+                end)
+            if not shown_ok then
+                logger.warn("wereaddesktop: offline-time dialog failed:",
+                    tostring(shown_err))
+                dialog = nil
+                self.pending_time_upload_dialog = nil
+            end
+        else
+            logger.warn("wereaddesktop: offline-time dialog init failed:",
+                tostring(created))
         end
     end
     runUploadNext()
@@ -1568,23 +1793,6 @@ function WeReadDesktop:showStorageManager()
         text = self:formatStorageSummary(summary),
         show_menu = false,
     })
-end
-
-local function formatDuration(seconds)
-    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
-    local hours = math.floor(seconds / 3600)
-    local minutes = math.floor((seconds % 3600) / 60)
-    local remain = seconds % 60
-    if hours > 0 then
-        if minutes > 0 then
-            return string.format(_("%d小时%d分钟"), hours, minutes)
-        end
-        return string.format(_("%d小时"), hours)
-    end
-    if minutes > 0 then
-        return string.format(_("%d分钟"), minutes)
-    end
-    return string.format(_("%d秒"), remain)
 end
 
 function WeReadDesktop:syncStatusLabel(summary)
@@ -2013,10 +2221,11 @@ function WeReadDesktop:cycleRotation()
     end
     local mode = (tonumber(Device.screen:getRotationMode()) or 0) + 1
     mode = mode % 4
-    if self.desktop_widget then
-        UIManager:close(self.desktop_widget)
-        self.desktop_widget = nil
-    end
+    -- BookshelfWidget relayouts itself on SetRotationMode (it computes the
+    -- post-rotation dimensions, since the broadcast reaches it before the
+    -- file manager below applies the rotation), so the desktop stays open
+    -- across the rotation instead of dropping the user back to the file
+    -- manager (review.md #8).
     UIManager:broadcastEvent(Event:new("SetRotationMode", mode))
 end
 
@@ -2609,6 +2818,8 @@ function WeReadDesktop:startWereadLogin()
     if not self.weread then
         return
     end
+    self:cancelAccountBoundUploads(
+        _("账号登录流程已开始，待上报任务已暂停"))
     logger.info("wereaddesktop: starting weread QR login")
     self.weread:startLogin(function(ok, _err)
         logger.info("wereaddesktop: weread login flow done, ok =", ok)
@@ -2628,6 +2839,7 @@ function WeReadDesktop:logoutWeread()
     if not self.weread then
         return
     end
+    self:cancelAccountBoundUploads()
     self.weread:logout()
     self.shelf_query = nil
     self:showTransientInfo(_("已退出微信读书登录"), 2)
@@ -2868,6 +3080,11 @@ function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
         return
     end
     self.weread_refreshing = true
+    -- Remember which account this refresh belongs to: if the user switches
+    -- accounts while the async fetch/covers/persist phase is in flight, the
+    -- result must be discarded instead of written into the new account's
+    -- shelf cache (review.md #1 follow-up).
+    local refresh_vid = self.weread:getAccountVid() or ""
     local silent = opts and opts.silent
     if not silent then
         self:showBusy(_("正在刷新微信读书书架…"))
@@ -2875,8 +3092,11 @@ function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
     logger.info("wereaddesktop: fetching weread shelf, force =", force_refresh,
         "silent =", silent)
     self.weread:fetchShelf(force_refresh, function(books, err)
-        self.weread_refreshing = false
         if not books then
+            -- The failure path releases the refresh lock immediately; the
+            -- success path holds it through covers + persistence so a
+            -- second refresh cannot overlap this one (review.md #7).
+            self.weread_refreshing = false
             logger.warn("wereaddesktop: shelf fetch failed:", err)
             if not silent then
                 self:closeBusy()
@@ -2887,6 +3107,19 @@ function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
         end
         logger.info("wereaddesktop: shelf fetched,", #books, "books; downloading covers")
         self:downloadCovers(books, function()
+            self.weread_refreshing = false
+            -- A logout/account switch during the async covers phase must
+            -- not persist the previous account's shelf cache: require the
+            -- same account (not just any login) we started with.
+            if not self.weread:isLoggedIn()
+                or (self.weread:getAccountVid() or "") ~= refresh_vid then
+                logger.info("wereaddesktop: shelf refresh discarded:",
+                    "account_changed_or_logged_out")
+                if not silent then
+                    self:closeBusy()
+                end
+                return
+            end
             -- Persist cover_path filled in by ensureCover.
             self.weread:saveShelf(books)
             logger.info("wereaddesktop: covers done, refreshing desktop")
@@ -2897,10 +3130,10 @@ function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
             self:maybePromptRelogin()
             if G_reader_settings:readSetting("wereaddesktop_debug_screenshot") then
                 UIManager:scheduleIn(1, function()
-                if self.desktop_widget then
-                    self.ui.screenshot:onScreenshot()
-                end
-            end)
+                    if self.desktop_widget then
+                        self.ui.screenshot:onScreenshot()
+                    end
+                end)
             end
         end)
     end)
@@ -3266,6 +3499,12 @@ function WeReadDesktop:showDesktop()
             self:showInfo(_("微读 · 微信读书桌面\n书架与书城数据来自微信读书（weread.qq.com），通过官方 App 的同一网关获取，仅供个人阅读使用。"))
         end,
         on_close = function()
+            -- Leaving the desktop (opening a book or exiting KOReader) must
+            -- release a paced replay's standby guard; the durable queue is
+            -- intentionally left for the next run.
+            if self.pending_time_upload_active then
+                self:cancelPendingReadingTimeUpload()
+            end
             self.desktop_widget = nil
         end,
     }

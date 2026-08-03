@@ -25,6 +25,8 @@ package.preload["ui/uimanager"] = function()
     }
 end
 local progress_retry_calls = {}
+local replay_dialogs = {}
+local hold_replay = false
 local store
 package.preload["progressuploader"] = function()
     local stub = {
@@ -56,15 +58,18 @@ package.preload["progressuploader"] = function()
                     local book = store and store.books
                         and store.books[tostring(book_id)]
                     if book then
-                        book.pending_replay_elapsed = nil
-                        book.pending_upload_position = nil
+                        if not hold_replay then
+                            book.pending_replay_elapsed = nil
+                            book.pending_upload_position = nil
+                        end
                     end
                 end
-                if opts.on_finished then
+                if opts.on_finished and not hold_replay then
                     opts.on_finished(book_id)
                 end
                 return true
             end
+            opts.cancel = function() end
             return opts
         end,
     }
@@ -98,6 +103,28 @@ end
 package.preload["ui/network/manager"] = function()
     return { isConnected = function() return true end }
 end
+package.preload["weread.ui.download_dialog"] = function()
+    return {
+        new = function(_, options)
+            options.show = function(self, show_overlay)
+                if show_overlay then
+                    show_overlay(self, "ui")
+                end
+            end
+            options.close = function(self)
+                self.closed = true
+            end
+            options.reportProgress = function(self, progress)
+                self.progress = progress
+            end
+            options.setTitle = function(self, title)
+                self.title = title
+            end
+            replay_dialogs[#replay_dialogs + 1] = options
+            return options
+        end,
+    }
+end
 
 G_reader_settings = {
     readSetting = function() return nil end,
@@ -113,6 +140,7 @@ store = {
             book_id = "3300050599",
             pending_upload_position = { book_id = "3300050599", percent = 42 },
             pending_upload_elapsed = 12,
+            pending_upload_user_vid = "10001",
         },
     },
 }
@@ -176,6 +204,7 @@ local instance = WeReadDesktop:new{
     current_weread_book_id = "3300050599",
 }
 instance.isNetworkConnected = function() return online end
+instance.showOverlay = noop
 
 local failures = 0
 local function check(label, condition)
@@ -244,6 +273,24 @@ check("manual offline-time upload holds and releases the standby guard",
 check("successful manual offline-time upload clears the queued time",
     store.books["3300050599"].pending_upload_elapsed == nil
     and store.books["3300050599"].pending_replay_elapsed == nil)
+check("manual replay creates and closes its progress dialog",
+    #replay_dialogs == 1 and replay_dialogs[1].closed == true
+    and replay_dialogs[1].buttons[1][1].text == "停止上报")
+
+store.books["3300050599"].pending_upload_position =
+    { book_id = "3300050599", percent = 42 }
+store.books["3300050599"].pending_upload_elapsed = 20
+hold_replay = true
+check("manual replay exposes an active progress dialog",
+    instance:startPendingReadingTimeUpload() == true
+    and instance.pending_time_upload_active == true
+    and #replay_dialogs == 2)
+replay_dialogs[2].buttons[1][1].callback()
+check("stopping replay releases the guard and keeps the queue",
+    instance.pending_time_upload_active ~= true
+    and standby_acquired == 2 and standby_released == 2
+    and (tonumber(store.books["3300050599"].pending_replay_elapsed) or 0) > 0)
+hold_replay = false
 
 if failures > 0 then
     print(failures .. " check(s) FAILED")

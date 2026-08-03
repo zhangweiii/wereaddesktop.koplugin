@@ -23,6 +23,7 @@ local T = require("ffi/util").template
 local Content = require("weread.lib.content")
 local DownloadDialog = require("weread.ui.download_dialog")
 local I18n = require("weread.lib.i18n")
+local lfs = require("libs/libkoreader-lfs")
 local Thoughts = require("weread.lib.thoughts")
 local WeRead = require("weread.lib.protocol")
 
@@ -134,20 +135,25 @@ function Downloader:_notifyCompletion(dl, ok, value)
     end
 end
 
--- Schedule any download step behind xpcall so an uncaught error always releases
--- the standby guard, closes the progress dialog, and reports the failure.
+-- Schedule any download step behind xpcall so an uncaught error always
+-- releases the standby guard, closes the progress dialog, and reports the
+-- failure. Error reporting must not depend on the guard still being held:
+-- a step releases the guard itself before later finishing operations
+-- (save book, refresh shelf) that can still throw (review.md #4).
 function Downloader:_scheduleGuarded(dl, step_fn, delay)
     UIManager:scheduleIn(delay or 0.1, function()
         local ok, err = xpcall(step_fn, debug.traceback)
-        if not ok and dl.standby_guard then
+        if not ok then
             self:_releaseStandby(dl)
             if dl.progress_dialog then
                 dl.progress_dialog:close()
                 dl.progress_dialog = nil
             end
             logger.err("download step failed:", log_error(err))
-            self:_notifyCompletion(dl, false, err)
-            self.show_info(T(_("Download failed:\n%1"), display_error(err)))
+            if not dl.completion_notified then
+                self:_notifyCompletion(dl, false, err)
+                self.show_info(T(_("Download failed:\n%1"), display_error(err)))
+            end
         end
     end)
 end
@@ -163,13 +169,23 @@ function Downloader:start(book, chapters, suffix, options)
         local missing = Content.list_missing_chapters(
             self.settings, book, chapters)
         if #missing == 0 then
-            self.show_transient(_("本书已完整，无需补齐"), 2)
-            if type(options.on_complete) == "function" then
-                pcall(options.on_complete, true, book.cached_file)
+            local cached_file = book.cached_file
+            if type(cached_file) == "string" and cached_file ~= ""
+                and lfs.attributes(cached_file, "mode") == "file" then
+                self.show_transient(_("本书已完整，无需补齐"), 2)
+                if type(options.on_complete) == "function" then
+                    pcall(options.on_complete, true, cached_file)
+                end
+                return true
             end
-            return true
+            -- Every chapter is cached but the final EPUB was never
+            -- finalized (a previous run failed between the parts-cache
+            -- writes and the final pack): repack from the parts cache
+            -- without re-downloading anything (review.md #14).
+            chapters = {}
+        else
+            chapters = missing
         end
-        chapters = missing
     end
     if not self.require_login(true, false) then
         if type(options.on_complete) == "function" then
@@ -468,7 +484,7 @@ function Downloader:_step(dl)
     end
 
     if dl.index > dl.total then
-        if #dl.selected == 0 then
+        if #dl.selected == 0 and not dl.fill_missing then
             if dl.progress_dialog then
                 dl.progress_dialog:close()
                 dl.progress_dialog = nil
@@ -490,6 +506,19 @@ function Downloader:_step(dl)
         if dl.fill_missing then
             save_chapters, save_bodies, save_assets, save_css =
                 self:_mergedRepackArgs(dl)
+            if #save_chapters == 0 then
+                -- Nothing was downloaded and nothing is cached: the book
+                -- is not recoverable from local state (review.md #14).
+                if dl.progress_dialog then
+                    dl.progress_dialog:close()
+                    dl.progress_dialog = nil
+                end
+                self:_releaseStandby(dl)
+                logger.err("book download failed: no chapters downloaded")
+                self:_notifyCompletion(dl, false, "no_chapters_downloaded")
+                self.show_info(_("No chapters were downloaded."))
+                return
+            end
         end
         local ok, path = pcall(function()
             if dl.single_chapter then

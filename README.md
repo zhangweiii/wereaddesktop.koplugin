@@ -20,7 +20,7 @@
   - 离线/崩溃恢复：待上传位置和阅读时长先落盘；联网后只静默补传最新进度，历史离线时长继续保留在本地，书籍已经关闭也不需要重新打开
   - 离线时长管理：设置页显示待上报时长；用户可手动开始后台上报，或只清除待上报时长而保留阅读进度
   - 可靠补报：手动上报按每次最多 60 秒、间隔 61 秒串行处理；中断后保留剩余部分，只有收到云端 `synckey` 确认才扣减本地队列
-  - 补报期间阅读：可以继续阅读微信书籍；实时进度仍会以 `rt=0` 更新，补报开始前的历史时长与期间新增时长分开保存，不会被重复扣减或用旧位置覆盖新进度
+  - 补报期间可见进度：按每段上报进度显示剩余时长，并可随时停止；停止或异常退出后剩余部分仍保留，不会被重复扣减或用旧位置覆盖新进度
 - **已读状态同步**：KOReader 读完弹窗中的「标记为读完/继续阅读」同步到微信读书云端；离线或失败时保留状态并在联网后重试
 - **状态栏**：时间、Wi-Fi 状态、设置和退出入口
 - **定时熄屏**：设置标签页可调整无操作自动休眠时长（关 / 5 / 15 / 30 / 60 分钟，复用 KOReader 内置 autosuspend 插件，默认 15 分钟）
@@ -44,10 +44,25 @@
 ## 安装
 
 1. 安装 [KOReader](https://github.com/koreader/koreader)（仅在 2026.07 版本验证过；插件依赖若干 KOReader 内部接口，见下文「KOReader 兼容性」，过旧或过新的版本可能不兼容）。
-2. 把 `wereaddesktop.koplugin` 目录复制到 KOReader 的 `plugins/` 目录下。
+2. 把 `wereaddesktop.koplugin` 目录复制到 KOReader 的 `plugins/` 目录下：Kindle 通常是 `/mnt/us/koreader/plugins/`，Kobo 通常是 `/mnt/onboard/.adds/koreader/plugins/`。
 3. 重启 KOReader，首次启动会弹出微信读书扫码登录。
 
+使用下方 Kindle 或 Kobo 一键安装器时，可跳过第 2、3 步，由安装脚本复制插件。
+
 启动时是否显示桌面取决于「启动时显示」设置：「历史记录」「收藏」「文件夹快捷方式」模式下不显示，其余模式（含默认的「文件管理器」）显示；退出书籍时始终回到桌面（可在「微读」菜单关闭）。
+
+### 设备直启入口（可选）
+
+插件本身可用于所有兼容的 KOReader 设备；`launchers/` 中的代码只负责适配不同厂商的系统启动机制。
+
+| 平台 | 模式 | GitHub Release 附件 | 入口 |
+| --- | --- | --- | --- |
+| Kindle | 一键安装器（KOL Booklet） | `WeRead_Kindle_Installer_v<版本>.zip` | 首页「微信读书」，另有 KUAL 兜底 |
+| Kobo | 一键安装器（NickelMenu / KFMon 二选一） | `WeRead_Kobo_Installer_v<版本>.zip` | 菜单入口或首页/书库封面 |
+
+Kindle 和 Kobo 用户都只需把对应的一键安装 ZIP 完整解压到电脑本地磁盘，然后运行其中的 `install.sh`。Kindle 脚本会询问固件范围并自动选择普通包或 hotfix；Kobo 脚本会询问 NickelMenu 或 KFMon 模式。文件复制完成后，脚本会在 macOS、Windows Git Bash/WSL 或常见 Linux 桌面环境中尝试自动安全弹出设备；失败时保留安装结果并提示手动弹出。具体见 [Kindle 启动器说明](launchers/kindle/weread-booklet/README.md) 和 [Kobo 启动器说明](launchers/kobo/README.md)。
+
+> **Kobo 未测试声明：** Kobo 两种启动模式尚未在真实设备上验证，不能据此宣称支持全部 Kobo 机型或固件。安装器要求先安装完整 KOReader 和所选启动器，不会捆绑或覆盖 KOReader、NickelMenu、KFMon。
 
 ## 使用
 
@@ -60,15 +75,15 @@
 - **标记读完**：读到书末后使用 KOReader 的读完弹窗，状态会同步到微信读书；同步失败会保留待办并在重新联网或再次打开书籍时重试
 - **设置**：底部「设置」标签或右上角齿轮打开 KOReader 设置菜单；「微读」菜单项在 KOReader 主菜单的「工具」分类下，可开关自动桌面、进度同步、登录/退出
 - **缓存与统计**：设置页的「微读缓存」显示本地占用和书籍明细；「阅读统计」读取微信读书本周/累计数据；长按已下载书籍可删除本地缓存
-- **进度与离线时长**：阅读进度默认开启同步，离线进度会在联网后以 `rt=0` 静默补传；离线阅读时长保留在本地，可在设置页「离线阅读时长」中选择后台上报或清除。后台补报耗时约为“分片数减一 × 61 秒”，期间设备会保持唤醒并可继续阅读；补报任务只处理启动时已经存在的历史时长，期间新增时长会独立保留，任务结束后可再次上报。由于服务端计时吞吐约为每分钟 60 秒，持续阅读时待上报总量可能暂时不会下降
+- **进度与离线时长**：阅读进度默认开启同步，离线进度会在联网后以 `rt=0` 静默补传；离线阅读时长保留在本地，可在设置页「离线阅读时长」中选择后台上报或清除。后台补报耗时约为“分片数减一 × 61 秒”，进度窗口会显示已处理和剩余时长，并提供停止按钮；停止、异常退出或重启后剩余部分仍可继续上报。补报任务只处理启动时已经存在的历史时长，期间新增时长会独立保留，任务结束后可再次上报。由于服务端计时吞吐约为每分钟 60 秒，持续阅读时待上报总量可能暂时不会下降
 
 ### 本地与高级升级
 
 维护或测试时，可以不经过 GitHub，直接从同一局域网内的电脑安装升级包：
 
-1. 在电脑上运行 `sh tools/release.sh` 生成 `dist/wereaddesktop.koplugin-v<版本>.tar.gz`。
+1. 在电脑上运行 `sh tools/release.sh`；它会生成三个发布文件，本地升级使用其中的 `dist/wereaddesktop.koplugin-v<版本>.tar.gz`。
 2. 运行 `sh tools/serve-update.sh`，优先记下它打印的短地址 `http://电脑IP:8765/u.tar.gz`；原始长地址也会同时保留。短地址指向目录中最近修改的升级包，该命令会把临时服务目录暴露在局域网内。
-3. 在 Kindle 的「设置 → 更新与版本」中连续点击「当前版本」7 次，进入「高级升级 → 安装局域网本地包」。输入框默认填好 `http://192.168.1.100:8765/u.tar.gz`，只需把 `192.168.1.100` 改成电脑 IP；确认后的地址会在 Kindle 本地保存，下次可直接使用或继续编辑。
+3. 在设备的「设置 → 更新与版本」中连续点击「当前版本」7 次，进入「高级升级 → 安装局域网本地包」。输入框默认填好 `http://192.168.1.100:8765/u.tar.gz`，只需把 `192.168.1.100` 改成电脑 IP；确认后的地址会在设备本地保存，下次可直接使用或继续编辑。
 4. 确认安装并重启 KOReader；安装器仍会校验压缩包布局，替换失败时会保留旧版本。
 
 同一个隐藏入口里的「安装 GitHub 指定版本」允许输入完整 SemVer（例如 `0.2.0-alpha.1`），因此可以安装旧版本或降级。高级入口只在当前 KOReader 进程内有效，且高级确认框会明确提示风险。局域网服务只为本次升级使用，完成后请按 `Ctrl-C` 停止；不要在不可信网络中暴露升级包。
@@ -88,6 +103,9 @@ wereaddesktop.koplugin/
 ├── weread/               -- 微信读书协议、下载、划线与评论客户端库（衍生自 weread.koplugin，见 NOTICE）
 │   └── lib/storage.lua   -- 本地缓存统计与安全删除
 └── spec/                 -- 无头测试（luajit 直接运行）
+launchers/
+├── kindle/               -- Kindle 首页 Booklet 与 KUAL 兜底入口
+└── kobo/                 -- Kobo NickelMenu / KFMon 两种入口
 ```
 
 运行确定性无头测试：
@@ -134,17 +152,19 @@ PLUGIN_DIR=/absolute/path/to/wereaddesktop.koplugin
 
 ### GitHub Actions
 
-- `.github/workflows/test.yml`：在每次 push 和 Pull Request 时自动运行 LuaJIT 编译检查、确定性回归测试，并验证发布压缩包可以生成；它不会登录微信读书，也不会部署到设备。
-- `.github/workflows/release.yml`：推送 `v*` 版本标签时自动构建 tar.gz 并创建 GitHub Release。
+- `.github/workflows/test.yml`：在每次 push 和 Pull Request 时自动运行 LuaJIT 编译检查、确定性回归测试，并验证插件压缩包与设备启动器；它不会登录微信读书，也不会部署到设备。
+- `.github/workflows/release.yml`：推送 `v*` 版本标签时自动构建通用插件包、Kindle 一键安装包和 Kobo 一键安装包，并创建 GitHub Release。
 
 ## 发布
 
 版本号唯一来源是 `wereaddesktop.koplugin/wereaddesktop_version.lua`，使用 SemVer；稳定版使用 `0.2.0`，预发布版使用 `0.2.0-beta.1` 或 `0.2.0-alpha.1`。发布新版本：
 
 1. 更新 `wereaddesktop_version.lua` 中的版本号。
-2. 运行 `sh tools/release.sh` 生成 `dist/wereaddesktop.koplugin-v<版本>.tar.gz`。
-3. 提交版本号后，在 GitHub 上推送 `v<版本>` 标签：`release.yml` 会自动构建 tar.gz 并创建 Release，带 `-alpha.N` / `-beta.N` 后缀的版本会标记为 GitHub prerelease（插件的「检查更新」只认完整名称的 `.tar.gz` 附件，且压缩包根目录必须是 `wereaddesktop.koplugin/`）。
+2. 在仓库根目录只运行 `sh tools/release.sh`。脚本会校验启动器，自动准备固定版本的 KOL/KindleTool，然后在 `dist/` 一次生成且只生成三个最终文件：通用插件 tar.gz、Kindle 一键安装 ZIP、Kobo 一键安装 ZIP。不要再分别运行平台目录下的构建脚本；同一版本重复构建时，只有这三个生成文件会在新包全部校验成功后被替换。
+3. 提交版本号后，在 GitHub 上推送 `v<版本>` 标签：`release.yml` 同样只调用上述根脚本，再把三个文件创建为 Release 附件。Kindle 所需的两种固件安装包和卸载包、Kobo 所需的两种启动配置都只作为对应一键安装器的内部 payload，不单独发布。带 `-alpha.N` / `-beta.N` 后缀的版本会标记为 GitHub prerelease（插件的「检查更新」只认完整名称的 `.tar.gz` 附件，且压缩包根目录必须是 `wereaddesktop.koplugin/`）。
 4. 发布仓库已配置在 `wereaddesktop.koplugin/updater.lua` 的 `GITHUB_REPO` 常量（当前为 `zhangweiii/wereaddesktop.koplugin`）；如需临时指向其它仓库（测试 fork），可通过 KOReader 设置 `wereaddesktop_update_repo` 覆盖。
+
+发布脚本需要 `tar`、`zip`、`unzip`、`node`，并通过 `curl` 或 `wget` 下载带 SHA-256 校验的固定依赖。Linux x86_64 会直接使用官方 KindleTool；macOS 会从固定提交编译 KindleTool，因此还需要 Xcode Command Line Tools，以及 `brew install libarchive nettle gmp pkg-config`。下载文件缓存在忽略提交的 `.release-cache/`；离线时也可通过 `KOL_BIN` 和 `KINDLETOOL` 指定现有文件。
 
 更新频道表示最多接受的风险级别：稳定版只接受稳定版，Beta 接受稳定版和 Beta，Alpha 接受三者。频道切换不会降级已安装版本；缺少 `wereaddesktop_update_channel` 或值非法时按稳定版处理。Alpha 可能无法启动，不建议在重要设备上使用。
 

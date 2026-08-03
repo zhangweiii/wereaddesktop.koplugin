@@ -72,9 +72,14 @@ function Updater.get_update_channel()
 end
 
 function Updater.repo()
-    local repo = G_reader_settings:readSetting("wereaddesktop_update_repo")
-    if type(repo) == "string" and repo:match("^[%w%.%-%_]+/[%w%.%-%_]+$") then
-        return repo
+    local settings = rawget(_G, "G_reader_settings")
+    if settings and type(settings.readSetting) == "function" then
+        local ok, repo = pcall(settings.readSetting, settings,
+            "wereaddesktop_update_repo")
+        if ok and type(repo) == "string"
+            and repo:match("^[%w%.%-%_]+/[%w%.%-%_]+$") then
+            return repo
+        end
     end
     return GITHUB_REPO
 end

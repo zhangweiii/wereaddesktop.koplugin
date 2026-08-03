@@ -84,6 +84,7 @@ function QRLogin:new(host, client, settings)
         client = client,
         settings = settings,
         generation = 0,
+        flow_active = false,
         login_cookies = nil,
         qr_dialog = nil,
         programmatic_close = false,
@@ -315,6 +316,7 @@ end
 
 function QRLogin:cancel()
     self.generation = self.generation + 1
+    self.flow_active = false
     self.login_cookies = nil
     self.started_at = nil
     self:_close_qr_dialog(true)
@@ -323,10 +325,15 @@ end
 function QRLogin:start()
     if not self.host:isNetworkOnline() then
         self.host:showOffline(_("QR login"))
+        -- Terminate the flow (generation bump + flow_active=false) so a
+        -- Bridge shadow of settings.update_auth is never left believing
+        -- the login is still in flight (review.md #3).
+        self:cancel()
         return
     end
 
     self:cancel()
+    self.flow_active = true
     local generation = self.generation
     self.started_at = os.time()
     self.host:showBusy(_("Getting login QR code..."))
@@ -341,6 +348,7 @@ function QRLogin:start()
         if not ok then
             logger.err("get login UID failed:", error_text(uid_or_error))
             self.host:showInfo(T(_("QR login failed:\n%1"), error_text(uid_or_error)))
+            self:cancel()
             return
         end
         self:_show_qr(uid_or_error, generation)

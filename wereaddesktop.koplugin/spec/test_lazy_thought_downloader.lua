@@ -27,6 +27,11 @@ end
 package.preload["ui/time"] = function()
     return { now = function() return 1000 end }
 end
+-- downloader.lua requires lfs for the fill-missing cached-file check; not
+-- exercised by this test, a nil-returning stub suffices.
+package.preload["libs/libkoreader-lfs"] = function()
+    return { attributes = function() return nil end }
+end
 package.preload["ffi/util"] = function()
     return { template = function(value) return value end }
 end

@@ -1,24 +1,26 @@
 #!/bin/sh
-# 将本地 wereaddesktop.koplugin 同步到 Kindle
+# 将本地 wereaddesktop.koplugin 同步到 Kindle 或 Kobo
 # 用法: sh tools/sync-kindle.sh
 set -eu
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$PROJECT_DIR/wereaddesktop.koplugin"
 
-# 自动检测 Kindle 挂载点
+# 自动检测 Kindle / Kobo 的 KOReader 插件目录
 PLUGINS_DIR=""
 DEST=""
-for d in /Volumes/Kindle /Volumes/KOBOeReader; do
-    if [ -d "$d/koreader/plugins" ]; then
-        PLUGINS_DIR="$d/koreader/plugins"
+for plugins_dir in \
+    /Volumes/Kindle/koreader/plugins \
+    /Volumes/KOBOeReader/.adds/koreader/plugins; do
+    if [ -d "$plugins_dir" ]; then
+        PLUGINS_DIR="$plugins_dir"
         DEST="$PLUGINS_DIR/wereaddesktop.koplugin"
         break
     fi
 done
 
 if [ -z "$DEST" ]; then
-    echo "找不到 Kindle/KOBO 设备，请确认已通过 USB 连接。" >&2
+    echo "找不到 Kindle/Kobo 设备，请确认已通过 USB 连接。" >&2
     exit 1
 fi
 

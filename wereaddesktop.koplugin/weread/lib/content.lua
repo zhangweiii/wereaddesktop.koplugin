@@ -225,12 +225,25 @@ local function write_file(path, data)
     if not made then
         return false
     end
-    local file = io.open(path, "wb")
+    -- Write via a temp file and check every step so a disk-full/IO error
+    -- cannot leave a truncated file that looks complete to the
+    -- missing-chapter scan (review.md #6).
+    local tmp_path = path .. ".tmp"
+    local file = io.open(tmp_path, "wb")
     if not file then
         return false
     end
-    file:write(data)
-    file:close()
+    local write_ok = file:write(data)
+    local close_ok = file:close()
+    if not write_ok or not close_ok then
+        os.remove(tmp_path)
+        return false
+    end
+    local rename_ok = os.rename(tmp_path, path)
+    if not rename_ok then
+        os.remove(tmp_path)
+        return false
+    end
     return true
 end
 
@@ -259,7 +272,13 @@ function Content.load_chapter_part(settings, book, uid)
     if not dir then
         return nil
     end
-    return read_file(dir .. "/" .. basename_safe(uid) .. ".xhtml")
+    local data = read_file(dir .. "/" .. basename_safe(uid) .. ".xhtml")
+    -- Treat missing AND empty/truncated files as absent so a fill-missing
+    -- repack never embeds a broken chapter body (review.md #6).
+    if type(data) ~= "string" or data == "" then
+        return nil
+    end
+    return data
 end
 
 -- Chapters of the catalog whose part body is missing from the cache
@@ -273,7 +292,12 @@ function Content.list_missing_chapters(settings, book, chapters)
     for index, chapter in ipairs(type(chapters) == "table" and chapters or {}) do
         local uid = tostring(chapter.chapterUid or chapter.chapter_uid or index)
         local path = dir .. "/" .. basename_safe(uid) .. ".xhtml"
-        if lfs.attributes(path, "mode") ~= "file" then
+        -- Require a regular file *and* a non-zero size: a zero-byte file is
+        -- the leftover of a failed write, and non-regular entries (dirs,
+        -- links) must not count as valid chapter bodies (review.md #6).
+        local mode = lfs.attributes(path, "mode")
+        local size = lfs.attributes(path, "size")
+        if mode ~= "file" or size == nil or tonumber(size) == 0 then
             table.insert(missing, chapter)
         end
     end

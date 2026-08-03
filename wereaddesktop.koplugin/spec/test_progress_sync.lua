@@ -74,22 +74,45 @@ local immediate_scheduler = {
     scheduleIn = function(_, _delay, fn) fn() end,
 }
 
+local TEST_USER_VID = "test-user"
+
+local function stamp_test_pending_owner(book)
+    if type(book) == "table" and book.pending_upload_user_vid == nil
+        and (type(book.pending_upload_position) == "table"
+            or (tonumber(book.pending_upload_elapsed) or 0) > 0
+            or (tonumber(book.pending_replay_elapsed) or 0) > 0) then
+        book.pending_upload_user_vid = TEST_USER_VID
+    end
+end
+
 local function make_settings(books)
     return {
-        data = { books = books },
+        data = {
+            account = { user_vid = TEST_USER_VID },
+            books = books,
+        },
         cache_dir = "/cache",
         saves = 0,
         flushes = 0,
         get = function(self, key, default)
             local value = self.data[key]
             if value == nil then return default end
+            if key == "books" and self.auto_owner ~= false then
+                for _, book in pairs(value) do
+                    stamp_test_pending_owner(book)
+                end
+            end
             return value
         end,
         set = function(self, key, value) self.data[key] = value end,
         flush = function(self) self.flushes = self.flushes + 1 end,
         get_book = function(self, book_id)
             local shelf = self.data.books or {}
-            return shelf[tostring(book_id)]
+            local book = shelf[tostring(book_id)]
+            if self.auto_owner ~= false then
+                stamp_test_pending_owner(book)
+            end
+            return book
         end,
         save_book = function(self, book_id, book)
             self.saves = self.saves + 1
@@ -1247,6 +1270,194 @@ do
             live_client.calls[#live_client.calls].elapsed_seconds == 60
             and settings.data.books["12345"].pending_upload_elapsed >= 122)
     end
+end
+
+-- A successful network response is followed by durable-state persistence.
+-- That bookkeeping runs in the scheduler callback too, so an unexpected
+-- storage error must not escape the UI event loop or strand the headless
+-- replay worker without firing on_finished.
+do
+    collectgarbage("collect")
+    clock = { t = 200000 }
+    local book = make_book()
+    book.pclts = "seed"
+    book.pending_upload_position = {
+        book_id = "12345", fraction = 0.5, percent = 50,
+        chapter_uid = 2, chapter_idx = 2, chapter_offset = 0,
+        summary = "Test Book",
+    }
+    book.pending_replay_elapsed = 60
+    book.pending_replay_started_at = clock.t - 60
+    local settings = make_settings({ ["12345"] = book })
+    local original_save_book = settings.save_book
+    local save_calls = 0
+    settings.save_book = function(self, book_id, value)
+        save_calls = save_calls + 1
+        if save_calls == 2 then
+            error("simulated persistence failure")
+        end
+        return original_save_book(self, book_id, value)
+    end
+    local queue = {}
+    local scheduler = {
+        scheduleIn = function(_, delay, fn)
+            table.insert(queue, { delay = delay, fn = fn })
+        end,
+    }
+    local finished = false
+    local uploader = ProgressUploader:new{
+        settings = settings,
+        client = make_client(),
+        scheduler = scheduler,
+        is_online = function() return true end,
+        now = now,
+        heartbeat_interval = false,
+        time_bucket = "replay",
+        on_finished = function() finished = true end,
+    }
+    check("replay persistence failure schedules an upload task",
+        uploader:retryPending("12345", { include_pending_time = true })
+        and #queue == 1)
+    local task_ok = pcall(queue[1].fn)
+    check("replay persistence failure stays inside the scheduler task", task_ok)
+    check("replay persistence failure still finishes the worker", finished)
+end
+
+-- Cancellation invalidates already scheduled work, keeps the replay bucket,
+-- and still notifies the owner so its standby guard can be released.
+do
+    clock = { t = 210000 }
+    local book = make_book()
+    book.pclts = "seed"
+    book.pending_upload_position = {
+        book_id = "12345", fraction = 0.5, percent = 50,
+        chapter_uid = 2, chapter_idx = 2, chapter_offset = 0,
+        summary = "Test Book",
+    }
+    book.pending_replay_elapsed = 60
+    local settings = make_settings({ ["12345"] = book })
+    local queue = {}
+    local scheduler = {
+        scheduleIn = function(_, delay, fn)
+            table.insert(queue, { delay = delay, fn = fn })
+        end,
+    }
+    local cancelled = false
+    local uploader = ProgressUploader:new{
+        settings = settings,
+        client = make_client(),
+        scheduler = scheduler,
+        is_online = function() return true end,
+        now = now,
+        heartbeat_interval = false,
+        time_bucket = "replay",
+        on_finished = function() cancelled = true end,
+    }
+    uploader:retryPending("12345", { include_pending_time = true })
+    check("replay cancellation API exists", type(uploader.cancel) == "function")
+    check("replay cancellation releases the worker", uploader:cancel("test_cancel")
+        and cancelled and not uploader.uploading)
+    check("replay cancellation keeps the durable time bucket",
+        settings.data.books["12345"].pending_replay_elapsed == 60)
+    local stale_ok = pcall(queue[1].fn)
+    check("replay cancellation ignores the stale scheduled task", stale_ok)
+end
+
+-- Account isolation is enforced again inside delayed callbacks. Enumerating a
+-- queue under account A is not enough: credentials may switch before the
+-- scheduled network request runs.
+do
+    clock = { t = 220000 }
+    local book = make_book()
+    local settings = make_settings({ ["12345"] = book })
+    local client = make_client()
+    local queue = {}
+    local uploader = ProgressUploader:new{
+        settings = settings,
+        client = client,
+        scheduler = {
+            scheduleIn = function(_, delay, fn)
+                queue[#queue + 1] = { delay = delay, fn = fn }
+            end,
+        },
+        get_fraction = function() return 0.5 end,
+        is_online = function() return true end,
+        now = now,
+        heartbeat_interval = false,
+    }
+    uploader:onReaderReady(BOOK_PATH)
+    queue[1].fn() -- captures/persists under A, then schedules the send
+    settings.data.account.user_vid = "other-user"
+    queue[2].fn()
+    check("account switch before delayed send performs no network request",
+        #client.calls == 0)
+    check("account switch keeps the queue bound to its original owner",
+        settings.data.books["12345"].pending_upload_user_vid == TEST_USER_VID
+        and type(settings.data.books["12345"].pending_upload_position) == "table")
+end
+
+-- Opening the same local book under B must not rewrite A's durable pending
+-- payload while B uploads its own live position.
+do
+    clock = { t = 230000 }
+    local book = make_book()
+    book.pending_upload_user_vid = "account-a"
+    book.pending_upload_position = {
+        book_id = "12345", fraction = 0.7, percent = 70,
+        chapter_uid = 3, chapter_idx = 3, chapter_offset = 100,
+        summary = "Account A",
+    }
+    book.pending_upload_elapsed = 45
+    local settings = make_settings({ ["12345"] = book })
+    settings.auto_owner = false
+    settings.data.account.user_vid = "account-b"
+    local client = make_client()
+    local uploader = ProgressUploader:new{
+        settings = settings,
+        client = client,
+        scheduler = immediate_scheduler,
+        get_fraction = function() return 0.2 end,
+        is_online = function() return true end,
+        now = now,
+        heartbeat_interval = false,
+    }
+    uploader:onReaderReady(BOOK_PATH)
+    local after = settings.data.books["12345"]
+    check("foreign pending payload is not overwritten by current reading",
+        after.pending_upload_user_vid == "account-a"
+        and after.pending_upload_position.percent == 70
+        and after.pending_upload_elapsed == 45)
+end
+
+-- Legacy queues without an owner are quarantined instead of being claimed by
+-- whichever account happens to log in first after the upgrade.
+do
+    clock = { t = 240000 }
+    local book = make_book()
+    book.pending_upload_position = {
+        book_id = "12345", fraction = 0.6, percent = 60,
+        chapter_uid = 2, chapter_idx = 2, chapter_offset = 100,
+        summary = "Unknown owner",
+    }
+    book.pending_upload_elapsed = 30
+    local settings = make_settings({ ["12345"] = book })
+    settings.auto_owner = false
+    local client = make_client()
+    local uploader = ProgressUploader:new{
+        settings = settings,
+        client = client,
+        scheduler = immediate_scheduler,
+        is_online = function() return true end,
+        now = now,
+        heartbeat_interval = false,
+    }
+    check("unowned durable queue is not resumed",
+        uploader:retryPending("12345", { include_pending_time = true }) == false
+        and #client.calls == 0)
+    check("unowned durable queue remains unchanged",
+        book.pending_upload_user_vid == nil
+        and book.pending_upload_position.percent == 60
+        and book.pending_upload_elapsed == 30)
 end
 
 if failures > 0 then

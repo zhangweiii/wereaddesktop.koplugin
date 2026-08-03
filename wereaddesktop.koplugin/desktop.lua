@@ -661,6 +661,23 @@ function BookshelfWidget:onSetDimensions(new_dimen)
     return true
 end
 
+-- Rotation in the file-manager context: UIManager broadcasts
+-- SetRotationMode top-down, so this widget receives the event *before*
+-- the file manager below has applied the rotation and Screen:getSize()
+-- still reports the old orientation. Compute the post-rotation size from
+-- the mode (same aspect when the mode parity is unchanged, swapped
+-- otherwise) and rebuild, mirroring onSetDimensions (review.md #8).
+function BookshelfWidget:onSetRotationMode(mode)
+    mode = tonumber(mode)
+    local current = Screen:getRotationMode()
+    local w, h = Screen:getWidth(), Screen:getHeight()
+    if mode and current and (mode % 2) ~= (current % 2) then
+        w, h = h, w
+    end
+    self:onSetDimensions(Geom:new{ w = w, h = h })
+    return true
+end
+
 function BookshelfWidget:buildTopBar(content_w)
     local bar_h = Screen:scaleBySize(44)
     local icon_size = Screen:scaleBySize(36)
@@ -1321,6 +1338,9 @@ end
 
 function BookshelfWidget:openSettingsPage(page)
     self.settings_sub_page = page
+    if self[1] then
+        self[1]:free() -- release the previous page's blitbuffers
+    end
     self:buildUI()
     UIManager:setDirty(self, "full")
 end
@@ -1620,6 +1640,14 @@ function BookshelfWidget:buildLoginUI()
 end
 
 function BookshelfWidget:onTap()
+    -- Only the bookshelf page (and the login prompt, where data.weread is
+    -- nil) closes on an empty-space tap: a stray tap must not dismiss the
+    -- store or settings pages mid-use (review.md #12).
+    if self.data.weread
+        and ((self.data.tab or "shelf") ~= "shelf"
+            or self.settings_sub_page) then
+        return true
+    end
     UIManager:close(self)
     return true
 end
@@ -1627,6 +1655,9 @@ end
 function BookshelfWidget:onClose()
     if self.settings_sub_page then
         self.settings_sub_page = nil
+        if self[1] then
+            self[1]:free() -- release the previous page's blitbuffers
+        end
         self:buildUI()
         UIManager:setDirty(self, "full")
         return true

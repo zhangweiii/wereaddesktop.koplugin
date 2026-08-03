@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build release tarball
+      - name: Build all release packages
         run: sh tools/release.sh
 
       - name: Parse version
@@ -38,6 +38,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ steps.version.outputs.value }}
-          files: dist/wereaddesktop.koplugin-v${{ steps.version.outputs.value }}.tar.gz
+          files: |
+            dist/wereaddesktop.koplugin-v${{ steps.version.outputs.value }}.tar.gz
+            dist/WeRead_Kindle_Installer_v${{ steps.version.outputs.value }}.zip
+            dist/WeRead_Kobo_Installer_v${{ steps.version.outputs.value }}.zip
+          fail_on_unmatched_files: true
           prerelease: ${{ steps.version.outputs.prerelease }}
           generate_release_notes: true

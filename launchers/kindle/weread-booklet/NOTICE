@@ -1,0 +1,14 @@
+The launcher build is derived from the KOL/KUAL Booklet launch mechanism:
+
+- KOL Booklet: https://github.com/yparitcher/KUAL_Booklet
+- KUAL Booklet: https://github.com/coplate/KUAL_Booklet
+- Original KindleLauncher: https://github.com/yifanlu/KindleLauncher
+
+The build process consumes an official KOL Booklet binary (provided by the user
+for local builds, or downloaded at a pinned URL and checksum in GitHub Actions)
+and patches only string constants needed for WeRead branding and an isolated
+MIME registration. No Amazon firmware libraries are distributed by this
+project.
+
+The generated launcher remains subject to the applicable upstream terms and
+this repository's AGPL-3.0 license.
