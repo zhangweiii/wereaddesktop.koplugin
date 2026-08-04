@@ -115,6 +115,7 @@ cd wereaddesktop.koplugin
 luajit spec/test_progress_sync.lua
 luajit spec/test_posupdate_wiring.lua
 luajit spec/test_desktop_overlays.lua
+luajit spec/test_async_cover_loader.lua
 luajit spec/test_lazy_thoughts.lua
 luajit spec/test_lazy_thought_downloader.lua
 luajit spec/test_lazy_thought_reader.lua

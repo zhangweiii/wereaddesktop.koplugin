@@ -740,8 +740,10 @@ function Bridge:findCachedCover(book_id)
 end
 
 -- Download the book's cover into the cache (blocking) and fill in
--- book.cover_path; cb(local_path|nil).
-function Bridge:ensureCover(book, cb)
+-- book.cover_path; cb(local_path|nil). request_options is forwarded to the
+-- HTTP client so background callers can enforce a total request deadline.
+function Bridge:ensureCover(book, cb, request_options)
+    cb = cb or function() end
     if type(book) ~= "table" or not book.book_id then
         cb(nil)
         return
@@ -759,7 +761,8 @@ function Bridge:ensureCover(book, cb)
     local ok, result = pcall(function()
         -- Stream with a hard byte cap: an oversized cover aborts the
         -- transfer instead of being buffered whole (review.md #18/#5).
-        return self.client:get_binary_limited(book.cover_url, 8 * 1024 * 1024)
+        return self.client:get_binary_limited(
+            book.cover_url, 8 * 1024 * 1024, request_options)
     end)
     if not ok or type(result) ~= "string" then
         logger.warn("cover download failed:",
@@ -775,13 +778,28 @@ function Bridge:ensureCover(book, cb)
         return
     end
     local path = self.covers_dir .. "/" .. md5(tostring(book.book_id)) .. ext
-    local f = io.open(path, "wb")
+    -- A background worker may be killed on timeout. Write beside the final
+    -- file first so findCachedCover() never accepts a truncated JPEG left by
+    -- an interrupted write.
+    local part_path = path .. ".part"
+    local f = io.open(part_path, "wb")
     if not f then
         cb(nil)
         return
     end
-    f:write(result)
-    f:close()
+    local wrote = f:write(result)
+    local closed = f:close()
+    if not wrote or not closed then
+        os.remove(part_path)
+        cb(nil)
+        return
+    end
+    local renamed = os.rename(part_path, path)
+    if not renamed then
+        os.remove(part_path)
+        cb(nil)
+        return
+    end
     book.cover_path = path
     cb(path)
 end

@@ -226,6 +226,40 @@ instance:installPluginUpdate("http://127.0.0.1/u.tar.gz", "local")
 check("local update asks KOReader to restart after install",
     restart_calls == 1)
 
+local refresh_order = {}
+local shelf_books = {
+    { book_id = "1", cover_url = "https://cdn/1.jpg" },
+    { book_id = "2", cover_url = "https://cdn/2.jpg" },
+}
+instance.weread = {
+    isLoggedIn = function() return true end,
+    getAccountVid = function() return "account-1" end,
+    fetchShelf = function(_, _, callback)
+        callback(shelf_books)
+    end,
+    saveShelf = function(_, books)
+        refresh_order[#refresh_order + 1] = "save:" .. tostring(#books)
+        return true
+    end,
+}
+instance.showBusy = noop
+instance.closeBusy = function()
+    refresh_order[#refresh_order + 1] = "close_busy"
+end
+instance.refreshDesktop = function()
+    refresh_order[#refresh_order + 1] = "refresh"
+end
+instance.maybePromptRelogin = noop
+instance.queueCoverDownloads = function(_, books)
+    refresh_order[#refresh_order + 1] = "queue:" .. tostring(#books)
+    check("shelf refresh lock is released before background covers",
+        instance.weread_refreshing == false)
+end
+instance:refreshWereadShelf(true)
+check("shelf is saved and shown before covers are queued",
+    table.concat(refresh_order, ",")
+        == "save:2,close_busy,refresh,queue:2")
+
 if failures > 0 then
     print(failures .. " check(s) FAILED")
     os.exit(1)

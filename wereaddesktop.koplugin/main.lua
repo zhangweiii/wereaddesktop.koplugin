@@ -5,6 +5,7 @@ manager at startup. Not logged in: a QR login prompt is shown instead.
 --]]--
 
 local BookshelfWidget = require("desktop")
+local CoverLoader = require("weread.lib.cover_loader")
 local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local ProgressUploader = require("progressuploader")
@@ -1183,6 +1184,14 @@ function WeReadDesktop:onResume()
     if self.progress_uploader then
         self.progress_uploader:onResume()
     end
+end
+
+function WeReadDesktop:onExit()
+    self:cancelCoverDownloads()
+end
+
+function WeReadDesktop:onCloseWidget()
+    self:cancelCoverDownloads()
 end
 
 function WeReadDesktop:refreshDesktop()
@@ -2818,6 +2827,7 @@ function WeReadDesktop:startWereadLogin()
     if not self.weread then
         return
     end
+    self:cancelCoverDownloads()
     self:cancelAccountBoundUploads(
         _("账号登录流程已开始，待上报任务已暂停"))
     logger.info("wereaddesktop: starting weread QR login")
@@ -2839,6 +2849,7 @@ function WeReadDesktop:logoutWeread()
     if not self.weread then
         return
     end
+    self:cancelCoverDownloads()
     self:cancelAccountBoundUploads()
     self.weread:logout()
     self.shelf_query = nil
@@ -3042,27 +3053,107 @@ function WeReadDesktop:maybePromptRelogin()
     end
 end
 
--- Download missing covers one scheduled task at a time: ensureCover is
--- blocking, so a plain loop over a whole shelf would freeze the UI for
--- seconds. Calls done() (still inside a scheduled task) after the last
--- cover has been attempted.
-function WeReadDesktop:downloadCovers(books, done)
-    local i = 0
-    local function step()
-        i = i + 1
-        if i > #books then
-            done()
+function WeReadDesktop:applyDownloadedCover(book_id, path)
+    local widget = self.desktop_widget
+    local data = widget and widget.data
+    if not data then
+        return
+    end
+    local updated = false
+    local function update_books(books)
+        for _, book in ipairs(books or {}) do
+            if tostring(book.book_id or "") == tostring(book_id) then
+                if book.cover_path ~= path then
+                    book.cover_path = path
+                    updated = true
+                end
+            end
+        end
+    end
+    update_books(data.books)
+    if data.store_search then
+        update_books(data.store_search.books)
+    end
+    for _, section in ipairs(data.store_feed or {}) do
+        update_books(section.books)
+    end
+    if not updated or self.cover_repaint_task then
+        return
+    end
+    local task
+    task = function()
+        if self.cover_repaint_task ~= task then
             return
         end
-        self.weread:ensureCover(books[i], function()
-            UIManager:scheduleIn(0, step)
-        end)
+        self.cover_repaint_task = nil
+        if self.desktop_widget == widget and widget.data then
+            -- Rebuild from the existing data only; collectData() scans local
+            -- book state and is too expensive to run after every cover.
+            widget:setData(widget.data)
+        end
     end
-    step()
+    self.cover_repaint_task = task
+    UIManager:scheduleIn(0.5, task)
 end
 
--- Fetch the shelf (blocking) and predownload covers, then repaint the
--- desktop. Callers must invoke this from a deferred/scheduled task.
+function WeReadDesktop:persistDownloadedCovers()
+    if not self.weread or not self.weread:isLoggedIn() then
+        return
+    end
+    local books = self.weread:getCachedShelf()
+    local changed = false
+    for _, book in ipairs(books or {}) do
+        local path = self.weread:findCachedCover(book.book_id)
+        if path and book.cover_path ~= path then
+            book.cover_path = path
+            changed = true
+        end
+    end
+    if changed then
+        self.weread:saveShelf(books)
+    end
+end
+
+function WeReadDesktop:getCoverLoader()
+    if self.cover_loader and self.cover_loader.bridge == self.weread then
+        return self.cover_loader
+    end
+    if self.cover_loader then
+        self.cover_loader:cancel()
+    end
+    self.cover_loader = CoverLoader:new{
+        bridge = self.weread,
+        on_cover = function(entry, path)
+            self:applyDownloadedCover(entry.book_id, path)
+        end,
+        on_idle = function()
+            self:persistDownloadedCovers()
+        end,
+    }
+    return self.cover_loader
+end
+
+function WeReadDesktop:queueCoverDownloads(books)
+    if not self.weread then
+        return 0
+    end
+    return self:getCoverLoader():enqueue(books)
+end
+
+function WeReadDesktop:cancelCoverDownloads()
+    if self.cover_repaint_task then
+        UIManager:unschedule(self.cover_repaint_task)
+        self.cover_repaint_task = nil
+    end
+    if self.cover_loader then
+        self.cover_loader:cancel()
+        self.cover_loader = nil
+    end
+end
+
+-- Fetch the shelf, persist and repaint it immediately, then enqueue covers
+-- in low-priority subprocesses. Callers invoke this from a scheduled task
+-- because the small shelf metadata requests themselves are still blocking.
 -- opts.silent: no busy spinner / no error popup (background auto-refresh
 -- with a cache already on screen).
 function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
@@ -3081,9 +3172,8 @@ function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
     end
     self.weread_refreshing = true
     -- Remember which account this refresh belongs to: if the user switches
-    -- accounts while the async fetch/covers/persist phase is in flight, the
-    -- result must be discarded instead of written into the new account's
-    -- shelf cache (review.md #1 follow-up).
+    -- accounts while the fetch is in flight, the result must be discarded
+    -- instead of written into the new account's shelf cache.
     local refresh_vid = self.weread:getAccountVid() or ""
     local silent = opts and opts.silent
     if not silent then
@@ -3093,9 +3183,6 @@ function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
         "silent =", silent)
     self.weread:fetchShelf(force_refresh, function(books, err)
         if not books then
-            -- The failure path releases the refresh lock immediately; the
-            -- success path holds it through covers + persistence so a
-            -- second refresh cannot overlap this one (review.md #7).
             self.weread_refreshing = false
             logger.warn("wereaddesktop: shelf fetch failed:", err)
             if not silent then
@@ -3105,37 +3192,32 @@ function WeReadDesktop:refreshWereadShelf(force_refresh, opts)
             -- Silent failure: keep showing the cached shelf.
             return
         end
-        logger.info("wereaddesktop: shelf fetched,", #books, "books; downloading covers")
-        self:downloadCovers(books, function()
-            self.weread_refreshing = false
-            -- A logout/account switch during the async covers phase must
-            -- not persist the previous account's shelf cache: require the
-            -- same account (not just any login) we started with.
-            if not self.weread:isLoggedIn()
-                or (self.weread:getAccountVid() or "") ~= refresh_vid then
-                logger.info("wereaddesktop: shelf refresh discarded:",
-                    "account_changed_or_logged_out")
-                if not silent then
-                    self:closeBusy()
-                end
-                return
-            end
-            -- Persist cover_path filled in by ensureCover.
-            self.weread:saveShelf(books)
-            logger.info("wereaddesktop: covers done, refreshing desktop")
+        self.weread_refreshing = false
+        if not self.weread:isLoggedIn()
+            or (self.weread:getAccountVid() or "") ~= refresh_vid then
+            logger.info("wereaddesktop: shelf refresh discarded:",
+                "account_changed_or_logged_out")
             if not silent then
                 self:closeBusy()
             end
-            self:refreshDesktop()
-            self:maybePromptRelogin()
-            if G_reader_settings:readSetting("wereaddesktop_debug_screenshot") then
-                UIManager:scheduleIn(1, function()
-                    if self.desktop_widget then
-                        self.ui.screenshot:onScreenshot()
-                    end
-                end)
-            end
-        end)
+            return
+        end
+        self.weread:saveShelf(books)
+        logger.info("wereaddesktop: shelf ready,", #books,
+            "books; queueing background covers")
+        if not silent then
+            self:closeBusy()
+        end
+        self:refreshDesktop()
+        self:queueCoverDownloads(books)
+        self:maybePromptRelogin()
+        if G_reader_settings:readSetting("wereaddesktop_debug_screenshot") then
+            UIManager:scheduleIn(1, function()
+                if self.desktop_widget then
+                    self.ui.screenshot:onScreenshot()
+                end
+            end)
+        end
     end)
 end
 
@@ -3167,10 +3249,9 @@ function WeReadDesktop:loadStoreFeed()
                     table.insert(all_books, book)
                 end
             end
-            self:downloadCovers(all_books, function()
-                self.store_feed = sections
-                self:refreshDesktop()
-            end)
+            self.store_feed = sections
+            self:queueCoverDownloads(all_books)
+            self:refreshDesktop()
         end)
     end)
 end
@@ -3221,10 +3302,9 @@ function WeReadDesktop:searchStoreBooks(keyword)
                 self.store_search = { keyword = keyword, error = tostring(err) }
                 self:refreshDesktop()
             else
-                self:downloadCovers(books, function()
-                    self.store_search = { keyword = keyword, books = books }
-                    self:refreshDesktop()
-                end)
+                self.store_search = { keyword = keyword, books = books }
+                self:queueCoverDownloads(books)
+                self:refreshDesktop()
             end
         end)
     end)

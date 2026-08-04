@@ -32,6 +32,7 @@ jobs:
             spec/test_progress_sync.lua \
             spec/test_posupdate_wiring.lua \
             spec/test_desktop_overlays.lua \
+            spec/test_async_cover_loader.lua \
             spec/test_lazy_thoughts.lua \
             spec/test_lazy_thought_downloader.lua \
             spec/test_lazy_thought_reader.lua \
