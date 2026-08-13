@@ -48,6 +48,18 @@ local function display_error(err)
     return text
 end
 
+local function download_record(book)
+    return {
+        title = book.title,
+        author = book.author,
+        cover = book.cover,
+        cached_file = book.cached_file,
+        cached_chapters = book.cached_chapters,
+        reader_url = book.reader_url,
+        cache_dir = book.cache_dir,
+    }
+end
+
 -- Block OS-level standby (Kindle powerd, Kobo lid/menu-suspend, etc.)
 local function preventOsStandby()
     if Device:isKindle() then
@@ -128,7 +140,11 @@ function Downloader:_notifyCompletion(dl, ok, value)
     if not dl or dl.completion_notified then return end
     dl.completion_notified = true
     if type(dl.on_complete) ~= "function" then return end
-    local called, err = pcall(dl.on_complete, ok == true, value)
+    local called, err = pcall(dl.on_complete, ok == true, value, {
+        failed_count = #(dl.failed or {}),
+        success_count = #(dl.selected or {}),
+        download_record = dl.download_record,
+    })
     if not called then
         logger.warn("download completion callback failed:",
             log_error(err))
@@ -141,7 +157,7 @@ end
 -- a step releases the guard itself before later finishing operations
 -- (save book, refresh shelf) that can still throw (review.md #4).
 function Downloader:_scheduleGuarded(dl, step_fn, delay)
-    UIManager:scheduleIn(delay or 0.1, function()
+    local run = function()
         local ok, err = xpcall(step_fn, debug.traceback)
         if not ok then
             self:_releaseStandby(dl)
@@ -152,16 +168,24 @@ function Downloader:_scheduleGuarded(dl, step_fn, delay)
             logger.err("download step failed:", log_error(err))
             if not dl.completion_notified then
                 self:_notifyCompletion(dl, false, err)
-                self.show_info(T(_("Download failed:\n%1"), display_error(err)))
+                if not dl.headless then
+                    self.show_info(T(_("Download failed:\n%1"), display_error(err)))
+                end
             end
         end
-    end)
+    end
+    if type(self.schedule_step) == "function" then
+        self.schedule_step(run, delay or 0.1)
+    else
+        UIManager:scheduleIn(delay or 0.1, run)
+    end
 end
 
 -- Public entry: start downloading the given chapters as one EPUB.
 -- options.fill_missing: `chapters` is the FULL catalog; only chapters
 -- missing from the on-disk parts cache (a previous partial download)
 -- are fetched, and the EPUB is repacked from cache + fresh downloads.
+-- options.include_comments: fetch underlines and their first comment page.
 function Downloader:start(book, chapters, suffix, options)
     options = options or {}
     local full_catalog = chapters
@@ -174,7 +198,11 @@ function Downloader:start(book, chapters, suffix, options)
                 and lfs.attributes(cached_file, "mode") == "file" then
                 self.show_transient(_("本书已完整，无需补齐"), 2)
                 if type(options.on_complete) == "function" then
-                    pcall(options.on_complete, true, cached_file)
+                    pcall(options.on_complete, true, cached_file, {
+                        failed_count = 0,
+                        success_count = 0,
+                        download_record = download_record(book),
+                    })
                 end
                 return true
             end
@@ -203,11 +231,15 @@ function Downloader:start(book, chapters, suffix, options)
             if type(options.on_complete) == "function" then
                 pcall(options.on_complete, false, err_init)
             end
-            self.show_info(T(_("Download failed:\n%1"), display_error(err_init)))
+            if not options.headless then
+                self.show_info(T(_("Download failed:\n%1"), display_error(err_init)))
+            end
             return
         end
 
-        self:_beginStandby()
+        if not options.headless then
+            self:_beginStandby()
+        end
         local total = #chapters
         local dl = {
             book = book,
@@ -224,32 +256,37 @@ function Downloader:start(book, chapters, suffix, options)
             total = total,
             failed = {},
             annotation_failed_batches = 0,
+            include_comments = options.include_comments == true,
+            headless = options.headless == true,
+            on_progress = options.on_progress,
             single_chapter = options.single_chapter == true,
             open_on_complete = options.open_on_complete == true,
             on_complete = options.on_complete,
             started_at = time.now(),
-            standby_guard = true,
+            standby_guard = options.headless ~= true,
         }
 
-        local progress_dialog = DownloadDialog:new{
-            title = T(_("Downloading: %1"), book.title or ""),
-            progress_max = total,
-            buttons = {{
-                {
-                    text = _("Cancel download"),
-                    callback = function()
-                        dl.cancelled = true
-                        if dl.progress_dialog then
-                            dl.progress_dialog:close()
-                            dl.progress_dialog = nil
-                        end
-                    end,
-                },
-            }},
-        }
-        dl.progress_dialog = progress_dialog
-        progress_dialog:show(self.show_overlay)
-        self.refresh_ui()
+        if not dl.headless then
+            local progress_dialog = DownloadDialog:new{
+                title = T(_("Downloading: %1"), book.title or ""),
+                progress_max = total,
+                buttons = {{
+                    {
+                        text = _("Cancel download"),
+                        callback = function()
+                            dl.cancelled = true
+                            if dl.progress_dialog then
+                                dl.progress_dialog:close()
+                                dl.progress_dialog = nil
+                            end
+                        end,
+                    },
+                }},
+            }
+            dl.progress_dialog = progress_dialog
+            progress_dialog:show(self.show_overlay)
+            self.refresh_ui()
+        end
 
         self:_scheduleGuarded(dl, function() self:_step(dl) end)
     end)
@@ -260,10 +297,23 @@ function Downloader:start(book, chapters, suffix, options)
 end
 
 function Downloader:_setStage(dl, title, progress)
-    if not dl.progress_dialog then return end
-    dl.progress_dialog:setTitle(title)
-    if progress then
+    if dl.progress_dialog then
+        dl.progress_dialog:setTitle(title)
+        if progress then
+            dl.progress_dialog:reportProgress(progress)
+        end
+    end
+    if type(dl.on_progress) == "function" then
+        pcall(dl.on_progress, title, progress or 0, dl.total)
+    end
+end
+
+function Downloader:_reportProgress(dl, progress)
+    if dl.progress_dialog then
         dl.progress_dialog:reportProgress(progress)
+    end
+    if type(dl.on_progress) == "function" then
+        pcall(dl.on_progress, nil, progress, dl.total)
     end
 end
 
@@ -284,9 +334,7 @@ function Downloader:_failChapter(dl, err)
     dl.current = nil
     dl.annotation = nil
     dl.index = dl.index + 1
-    if dl.progress_dialog then
-        dl.progress_dialog:reportProgress(dl.index - 1)
-    end
+    self:_reportProgress(dl, dl.index - 1)
     self:_scheduleGuarded(dl, function() self:_step(dl) end)
 end
 
@@ -330,9 +378,7 @@ function Downloader:_finishChapter(dl)
     dl.current = nil
     dl.annotation = nil
     dl.index = dl.index + 1
-    if dl.progress_dialog then
-        dl.progress_dialog:reportProgress(dl.index - 1)
-    end
+    self:_reportProgress(dl, dl.index - 1)
     self:_scheduleGuarded(dl, function() self:_step(dl) end)
 end
 
@@ -347,10 +393,13 @@ function Downloader:_applyAnnotations(dl)
     local started = time.now()
     local ok, processed, annotation_css = pcall(function()
         return Thoughts.apply_data(self.settings, book_id, chapter.chapterUid,
-            dl.current.xhtml, annotation.underlines, nil, dl.book)
+            dl.current.xhtml, annotation.underlines, annotation.reviews, dl.book, {
+                rebuild_thought_db = not dl.fill_missing
+                    and not dl.single_chapter and dl.index == 1,
+            })
     end)
     self:_perf(dl, "apply_annotations", started, "ok=", tostring(ok),
-        "thought_locations=", tostring(annotation.thought_locations or 0))
+        "reviews=", tostring(#(annotation.reviews or {})))
     if not ok then
         self:_failChapter(dl, processed)
         return
@@ -362,6 +411,72 @@ function Downloader:_applyAnnotations(dl)
         dl.state.annotation_css_seen[annotation_css] = true
     end
     self:_finishChapter(dl)
+end
+
+function Downloader:_annotationBatch(dl)
+    if dl.cancelled then
+        self:_releaseStandby(dl)
+        self:_notifyCompletion(dl, false, "cancelled")
+        self.show_transient(_("Download cancelled"), 2)
+        return
+    end
+    local annotation = dl.annotation
+    if not annotation then
+        self:_finishChapter(dl)
+        return
+    end
+    if annotation.batch_index > #annotation.batches then
+        self:_applyAnnotations(dl)
+        return
+    end
+
+    local batch_index = annotation.batch_index
+    local batch_total = #annotation.batches
+    local fractional = dl.index - 0.85
+        + 0.7 * batch_index / math.max(1, batch_total)
+    self:_setStage(dl,
+        T(_("Downloading thoughts %1/%2 · chapter %3/%4"),
+            tostring(batch_index), tostring(batch_total),
+            tostring(dl.index), tostring(dl.total)),
+        fractional)
+
+    local started = time.now()
+    local ok, result, err = self.client:get_chapter_reviews_batch(
+        dl.book.book_id or dl.book.bookId,
+        dl.current.chapter.chapterUid,
+        annotation.batches[batch_index]
+    )
+    self:_perf(dl, "thought_batch", started,
+        "batch=", tostring(batch_index) .. "/" .. tostring(batch_total),
+        "ok=", tostring(ok), "retry=", tostring(annotation.retry))
+
+    if not ok then
+        if annotation.retry < 2 then
+            annotation.retry = annotation.retry + 1
+            self:_setStage(dl,
+                T(_("Retrying thoughts %1/%2 · attempt %3"),
+                    tostring(batch_index), tostring(batch_total),
+                    tostring(annotation.retry)),
+                fractional)
+            self:_scheduleGuarded(dl,
+                function() self:_annotationBatch(dl) end,
+                0.6 * annotation.retry)
+            return
+        end
+        dl.annotation_failed_batches = dl.annotation_failed_batches + 1
+        logger.warn("thought batch skipped:",
+            "batch=", tostring(batch_index) .. "/" .. tostring(batch_total),
+            "error=", log_error(err or "unknown"))
+    elseif result and type(result.reviews) == "table" then
+        for _i, review in ipairs(result.reviews) do
+            annotation.reviews[#annotation.reviews + 1] = review
+        end
+    end
+
+    annotation.batch_index = batch_index + 1
+    annotation.retry = 0
+    self:_scheduleGuarded(dl,
+        function() self:_annotationBatch(dl) end, 0.3)
 end
 
 function Downloader:_startAnnotations(dl)
@@ -383,17 +498,17 @@ function Downloader:_startAnnotations(dl)
     end
     dl.annotation = {
         underlines = underlines,
-        thought_locations = 0,
+        reviews = {},
+        batches = self.client:build_chapter_review_batches(ranges),
+        batch_index = 1,
+        retry = 0,
     }
-    for _, underline in ipairs(underlines.underlines or {}) do
-        if tonumber(underline.type) == 0 then
-            dl.annotation.thought_locations =
-                dl.annotation.thought_locations + 1
-        end
+    if #dl.annotation.batches == 0 then
+        self:_applyAnnotations(dl)
+    else
+        self:_scheduleGuarded(dl,
+            function() self:_annotationBatch(dl) end, 0.1)
     end
-    -- Comment bodies are intentionally not downloaded here. Every underline
-    -- stores a lazy range link; type=0 locations additionally show a star.
-    self:_applyAnnotations(dl)
 end
 
 -- Fill-missing repack: walk the FULL catalog, taking each chapter's
@@ -449,6 +564,7 @@ function Downloader:_showIncompleteDialog(dl, path, completion_text)
                         UIManager:close(dialog)
                         self:start(dl.book, dl.catalog or dl.chapters, dl.suffix, {
                             fill_missing = true,
+                            include_comments = dl.include_comments,
                             open_on_complete = dl.open_on_complete,
                             on_complete = dl.on_complete,
                         })
@@ -492,7 +608,9 @@ function Downloader:_step(dl)
             self:_releaseStandby(dl)
             logger.err("book download failed: no chapters downloaded")
             self:_notifyCompletion(dl, false, "no_chapters_downloaded")
-            self.show_info(_("No chapters were downloaded."))
+            if not dl.headless then
+                self.show_info(_("No chapters were downloaded."))
+            end
             return
         end
         self:_setStage(dl, _("Building EPUB..."), dl.total)
@@ -516,7 +634,9 @@ function Downloader:_step(dl)
                 self:_releaseStandby(dl)
                 logger.err("book download failed: no chapters downloaded")
                 self:_notifyCompletion(dl, false, "no_chapters_downloaded")
-                self.show_info(_("No chapters were downloaded."))
+                if not dl.headless then
+                    self.show_info(_("No chapters were downloaded."))
+                end
                 return
             end
         end
@@ -555,14 +675,23 @@ function Downloader:_step(dl)
                 dl.book.cached_file = path
             end
             dl.book.reader_url = dl.book.reader_url or WeRead.reader_url(book_id)
-            self.settings:save_book(tostring(book_id), dl.book)
-            self.settings:flush()
+            dl.download_record = download_record(dl.book)
+            -- A headless downloader runs in a forked process. Its book record
+            -- is a snapshot from download start, so saving the whole record
+            -- here could overwrite reading progress written by the parent in
+            -- the meantime. The parent merges only these download fields.
+            if not dl.headless then
+                self.settings:save_book(tostring(book_id), dl.book)
+                self.settings:flush()
+            end
         end
         self.refresh_shelf()
         if not ok then
             logger.err("save downloaded book failed:", log_error(path))
             self:_notifyCompletion(dl, false, path)
-            self.show_info(T(_("Download failed:\n%1"), display_error(path)))
+            if not dl.headless then
+                self.show_info(T(_("Download failed:\n%1"), display_error(path)))
+            end
             return
         end
         if #dl.failed > 0 then
@@ -599,6 +728,9 @@ function Downloader:_step(dl)
             return
         end
         self:_notifyCompletion(dl, true, path)
+        if dl.headless then
+            return
+        end
         if #dl.failed > 0 then
             -- Incomplete book: offer a fill-missing run (only the failed
             -- chapters are re-downloaded; the rest comes from the parts
@@ -635,7 +767,7 @@ function Downloader:_step(dl)
         return
     end
     dl.current = { chapter = chapter, xhtml = xhtml }
-    if Thoughts.is_download_enabled(self.settings) then
+    if dl.include_comments then
         self:_startAnnotations(dl)
     else
         self:_finishChapter(dl)

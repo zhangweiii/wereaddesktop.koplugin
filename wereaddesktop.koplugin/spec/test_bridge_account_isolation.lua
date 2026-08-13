@@ -195,6 +195,23 @@ check("offline login restores the auth method and reports failure",
     offline_result == false and settings.update_auth == original_update_auth
     and bridge.qr_login == nil)
 
+-- Per-download choices survive the bridge between the desktop and engine.
+local downloader_options
+bridge._pending_book = { book_id = "book-1" }
+bridge.downloader = {
+    start = function(_, _book, _chapters, _suffix, options)
+        downloader_options = options
+        return true
+    end,
+}
+bridge:downloadBook({ book_id = "book-1" }, {}, nil, {
+    include_comments = true,
+    open_on_complete = false,
+})
+check("bridge forwards the per-download comment choice",
+    downloader_options and downloader_options.include_comments == true
+    and downloader_options.open_on_complete == false)
+
 if failures > 0 then
     print(failures .. " check(s) FAILED")
     os.exit(1)

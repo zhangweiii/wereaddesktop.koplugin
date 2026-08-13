@@ -964,7 +964,9 @@ end
 -- once after the pipeline's own UI has been taken care of.
 -- opts.fill_missing: only download chapters missing from the parts cache
 --   and repack (chapters must be the full catalog).
+-- opts.include_comments: download underlines and comment bodies for offline use.
 -- opts.open_on_complete: override the auto-open (default true).
+-- opts.headless/on_progress: internal background-runner hooks.
 function Bridge:downloadBook(shelf_book, chapters, cb, opts)
     opts = opts or {}
     local book_id = tostring(shelf_book.book_id)
@@ -980,13 +982,16 @@ function Bridge:downloadBook(shelf_book, chapters, cb, opts)
     local downloader = self:_getDownloader()
     return downloader:start(lib_book, chapters, "full", {
         fill_missing = opts.fill_missing == true,
+        include_comments = opts.include_comments == true,
         open_on_complete = opts.open_on_complete ~= false,
-        on_complete = function(ok, value)
+        headless = opts.headless == true,
+        on_progress = opts.on_progress,
+        on_complete = function(ok, value, metadata)
             if ok then
                 self:invalidateStorageSummary()
                 self._download_err = nil
                 if cb then
-                    pcall(cb, value)
+                    pcall(cb, value, nil, metadata)
                 end
                 return
             end
@@ -998,7 +1003,7 @@ function Bridge:downloadBook(shelf_book, chapters, cb, opts)
                 self._download_err = value
             end
             if cb then
-                pcall(cb, nil, value)
+                pcall(cb, nil, value, metadata)
             end
         end,
     })

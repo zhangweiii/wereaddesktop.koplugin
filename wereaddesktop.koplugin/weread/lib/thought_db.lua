@@ -174,6 +174,32 @@ local function insert_reviews(db, chapter_uid, reviews)
     return inserted
 end
 
+local function insert_range_states(db, chapter_uid, reviews)
+    local statement = db:prepare([[
+        INSERT OR REPLACE INTO review_ranges
+            (chapter_uid, range, fetched_at, max_idx, sync_key,
+             total_count, has_more)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ]])
+    local fetched_at = os.time()
+    for _, review in ipairs(reviews or {}) do
+        local range = type(review) == "table" and review.range or nil
+        if type(range) == "string" and range ~= "" then
+            statement:reset():bind(
+                chapter_uid,
+                range,
+                fetched_at,
+                tonumber(review.maxIdx) or 0,
+                tonumber(review.synckey) or 0,
+                tonumber(review.totalCount) or 0,
+                (review.hasMore == true
+                    or tonumber(review.hasMore) == 1) and 1 or 0
+            ):step()
+        end
+    end
+    statement:close()
+end
+
 --- Replace all thought rows for one chapter in a single transaction.
 function ThoughtDB.putReviews(db, chapter_uid, reviews)
     if not db or type(reviews) ~= "table" then return false end
@@ -189,7 +215,14 @@ function ThoughtDB.putReviews(db, chapter_uid, reviews)
         delete_stmt:reset():bind(chapter_uid):step()
         delete_stmt:close()
 
+        local delete_ranges = db:prepare(
+            "DELETE FROM review_ranges WHERE chapter_uid=?"
+        )
+        delete_ranges:reset():bind(chapter_uid):step()
+        delete_ranges:close()
+
         insert_reviews(db, chapter_uid, reviews)
+        insert_range_states(db, chapter_uid, reviews)
 
         db:exec("COMMIT")
         transaction_open = false

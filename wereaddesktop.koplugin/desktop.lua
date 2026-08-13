@@ -108,6 +108,60 @@ local function buildFinishedBadge()
     }
 end
 
+-- Full-width download panel pinned to the bottom of a cover. The numeric
+-- percentage stays readable on e-ink while the solid bar below it grows from
+-- left to right whenever another chapter finishes.
+local function buildDownloadPanel(progress, max_w)
+    local percent = math.max(0, math.min(100,
+        math.floor((tonumber(progress) or 0) + 0.5)))
+    local border = Size.line.thin
+    local inner_w = math.max(1, max_w - 2 * border)
+    local text_face = Font:getFace("cfont", Screen:scaleBySize(7))
+    local text_h = textHeight(text_face)
+    local text_padding = Screen:scaleBySize(2)
+    local bar_h = math.max(Size.line.thin, Screen:scaleBySize(5))
+    local fill_w = math.floor(inner_w * percent / 100)
+    local bar = OverlapGroup:new{
+        allow_mirroring = false,
+        dimen = Geom:new{ w = inner_w, h = bar_h },
+        LineWidget:new{
+            dimen = Geom:new{ w = inner_w, h = bar_h },
+            background = Blitbuffer.COLOR_GRAY_C,
+        },
+    }
+    if fill_w > 0 then
+        local fill = LineWidget:new{
+            dimen = Geom:new{ w = fill_w, h = bar_h },
+            background = Blitbuffer.COLOR_BLACK,
+        }
+        fill.overlap_offset = { 0, 0 }
+        table.insert(bar, fill)
+    end
+    return FrameContainer:new{
+        width = max_w,
+        margin = 0,
+        padding = 0,
+        bordersize = border,
+        color = Blitbuffer.COLOR_GRAY_9,
+        background = Blitbuffer.COLOR_WHITE,
+        VerticalGroup:new{
+            align = "center",
+            CenterContainer:new{
+                dimen = Geom:new{
+                    w = inner_w,
+                    h = text_h + 2 * text_padding,
+                },
+                TextWidget:new{
+                    text = string.format(_("下载 %d%%"), percent),
+                    face = text_face,
+                    fgcolor = Blitbuffer.COLOR_BLACK,
+                },
+            },
+            bar,
+        },
+    }
+end
+
 --[[--
 WeRead cover with a status marker overlaid on the cover box: finished
 books get a checkmark badge in the top-right corner; other books show
@@ -115,7 +169,7 @@ nothing. Works on top of real and placeholder covers alike.
 --]]--
 local function buildWereadCoverBadged(book, max_w, max_h)
     local cover = buildWereadCover(book, max_w, max_h)
-    if not book.finished then
+    if not book.finished and book.download_progress == nil then
         return cover -- no marker: clean cover
     end
     local group = OverlapGroup:new{
@@ -123,11 +177,36 @@ local function buildWereadCoverBadged(book, max_w, max_h)
         dimen = Geom:new{ w = max_w, h = max_h },
         cover,
     }
-    local badge = buildFinishedBadge()
-    local bs = badge:getSize()
-    badge.overlap_offset = { max_w - bs.w, 0 }
-    table.insert(group, badge)
+    if book.finished then
+        local badge = buildFinishedBadge()
+        local bs = badge:getSize()
+        badge.overlap_offset = { max_w - bs.w, 0 }
+        table.insert(group, badge)
+    end
+    if book.download_progress ~= nil then
+        local progress_panel = buildDownloadPanel(
+            book.download_progress, max_w)
+        local ps = progress_panel:getSize()
+        progress_panel.overlap_offset = { 0, math.max(0, max_h - ps.h) }
+        table.insert(group, progress_panel)
+    end
     return group
+end
+
+local function displayBook(book, download_state)
+    local display = {
+        text = book.text,
+        cover_path = book.cover_path,
+        finished = book.finished == true,
+    }
+    if type(download_state) == "table"
+        and tostring(download_state.book_id or "")
+            == tostring(book.book_id or "") then
+        local total = math.max(1, tonumber(download_state.total) or 1)
+        display.download_progress = 100
+            * (tonumber(download_state.progress) or 0) / total
+    end
+    return display
 end
 
 --[[--
@@ -901,13 +980,7 @@ function BookshelfWidget:buildWereadUI()
                 local book = books[i]
                 -- Normalize for WereadBookCell: the cover badging only
                 -- needs finished, everything else is a clean cover.
-                local cell_book = {
-                    text = book.text,
-                    cover_path = book.cover_path,
-                }
-                if book.finished then
-                    cell_book.finished = true
-                end
+                local cell_book = displayBook(book, self.data.download_state)
                 table.insert(row, WereadBookCell:new{
                     book = cell_book,
                     dimen = Geom:new{ w = cell_w, h = row_h },
@@ -1118,16 +1191,18 @@ function BookshelfWidget:buildStoreUI()
                 end
                 local book = s.books[i]
                 table.insert(row, WereadBookCell:new{
-                    book = {
-                        text = book.text,
-                        cover_path = book.cover_path,
-                    },
+                    book = displayBook(book, self.data.download_state),
                     dimen = Geom:new{ w = cell_w, h = row_h },
                     cover_h = cover_h,
                     show_parent = self,
                     callback = function()
                         if self.on_open_book then
                             self.on_open_book(book)
+                        end
+                    end,
+                    hold_callback = function()
+                        if self.on_book_hold then
+                            self.on_book_hold(book)
                         end
                     end,
                 })
@@ -1193,16 +1268,18 @@ function BookshelfWidget:addStoreGrid(page, add, books, columns, content_w, avai
             end
             local book = books[i]
             table.insert(row, WereadBookCell:new{
-                book = {
-                    text = book.text,
-                    cover_path = book.cover_path,
-                },
+                book = displayBook(book, self.data.download_state),
                 dimen = Geom:new{ w = cell_w, h = row_h },
                 cover_h = cover_h,
                 show_parent = self,
                 callback = function()
                     if self.on_open_book then
                         self.on_open_book(book)
+                    end
+                end,
+                hold_callback = function()
+                    if self.on_book_hold then
+                        self.on_book_hold(book)
                     end
                 end,
             })

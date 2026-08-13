@@ -183,6 +183,33 @@ check("input overlay is above desktop",
     input_dialog ~= instance.desktop_widget
         and stack[#stack].widget == input_dialog)
 
+local download_options = {}
+instance.startBackgroundBookDownload = function(
+    _, _book, _chapters, options)
+    download_options[#download_options + 1] = options
+end
+instance:confirmWereadDownload(
+    { book_id = "1", text = "测试书" },
+    { { chapterUid = 1 } }
+)
+local download_dialog = stack[#stack].widget
+check("download confirmation offers plain text and comments",
+    download_dialog.buttons[1][1].text == "仅下载正文"
+    and download_dialog.buttons[1][2].text == "正文及评论"
+    and download_dialog.buttons[2][1].text == "取消")
+download_dialog.buttons[1][1].callback()
+check("plain-text choice is forwarded to background runner",
+    download_options[1] and download_options[1].include_comments == false)
+
+instance:confirmWereadDownload(
+    { book_id = "1", text = "测试书" },
+    { { chapterUid = 1 } }
+)
+download_dialog = stack[#stack].widget
+download_dialog.buttons[1][2].callback()
+check("comment choice is forwarded to background runner",
+    download_options[2] and download_options[2].include_comments == true)
+
 local cleared = false
 instance.refreshDesktop = noop
 instance.weread = {

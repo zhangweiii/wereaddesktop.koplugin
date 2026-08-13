@@ -12,6 +12,8 @@ package.path = package.path .. ";./?.lua"
 
 local noop = function() end
 local recorded = {}
+local timeout_calls = {}
+local response_headers = {}
 
 package.preload["ltn12"] = function()
     return { source = { string = function() end } }
@@ -21,7 +23,12 @@ package.preload["weread.lib.logger"] = function()
 end
 package.preload["socketutil"] = function()
     return {
-        set_timeout = noop,
+        set_timeout = function(_, block_timeout, total_timeout)
+            timeout_calls[#timeout_calls + 1] = {
+                block = block_timeout,
+                total = total_timeout,
+            }
+        end,
         reset_timeout = noop,
         table_sink = function() return noop end,
     }
@@ -47,7 +54,7 @@ package.preload["socket.http"] = function()
                 return nil, 302, { Location = recorded.redirect_target },
                     "302 Found"
             end
-            return nil, 200, {}, "200 OK"
+            return nil, 200, response_headers, "200 OK"
         end,
     }
 end
@@ -103,7 +110,34 @@ end
 
 local client = Client:new{
     get = function() return "" end,
+    merge_set_cookie = function(_, _set_cookie, options)
+        recorded.cookie_flush = options.flush
+    end,
 }
+
+----------------------------------------------------------------
+-- Every request has a finite wall-clock limit. A per-block timeout alone
+-- can run forever on a weak connection that keeps trickling bytes.
+----------------------------------------------------------------
+client:request{
+    url = "https://weread.qq.com/web/test-timeout",
+    method = "GET",
+}
+check("default HTTP request has a finite total timeout",
+    timeout_calls[#timeout_calls]
+        and timeout_calls[#timeout_calls].block > 0
+        and timeout_calls[#timeout_calls].total > 0)
+
+response_headers = { ["Set-Cookie"] = "wr_skey=child" }
+client.persist_response_cookies = false
+client:request{
+    url = "https://weread.qq.com/web/test-child-cookie",
+    method = "GET",
+}
+check("forked clients merge response cookies without flushing settings",
+    recorded.cookie_flush == false)
+client.persist_response_cookies = nil
+response_headers = {}
 
 ----------------------------------------------------------------
 -- Cross-origin redirect strips credentials in any header casing.

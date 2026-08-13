@@ -1188,10 +1188,12 @@ end
 
 function WeReadDesktop:onExit()
     self:cancelCoverDownloads()
+    self:shutdownBookDownload()
 end
 
 function WeReadDesktop:onCloseWidget()
     self:cancelCoverDownloads()
+    self:shutdownBookDownload()
 end
 
 function WeReadDesktop:refreshDesktop()
@@ -2828,6 +2830,7 @@ function WeReadDesktop:startWereadLogin()
         return
     end
     self:cancelCoverDownloads()
+    self:shutdownBookDownload()
     self:cancelAccountBoundUploads(
         _("账号登录流程已开始，待上报任务已暂停"))
     logger.info("wereaddesktop: starting weread QR login")
@@ -2850,6 +2853,7 @@ function WeReadDesktop:logoutWeread()
         return
     end
     self:cancelCoverDownloads()
+    self:shutdownBookDownload()
     self:cancelAccountBoundUploads()
     self.weread:logout()
     self.shelf_query = nil
@@ -2871,27 +2875,39 @@ end
 -- a stray tap anywhere on screen would otherwise close the dialog
 -- (ButtonDialog defaults to TapClose on the whole screen), which reads
 -- as "the dialog flashed and vanished".
-function WeReadDesktop:confirmWereadDownload(book, chapters)
+function WeReadDesktop:confirmWereadDownload(book, chapters, download_opts)
+    download_opts = download_opts or {}
     local ButtonDialog = require("ui/widget/buttondialog")
     local dialog
+    local function startDownload(include_comments)
+        UIManager:close(dialog)
+        self:startBackgroundBookDownload(book, chapters, {
+            fill_missing = download_opts.fill_missing == true,
+            include_comments = include_comments,
+        })
+    end
     dialog = ButtonDialog:new{
         modal = true,
         dismissable = false,
         title = string.format(
-            _("《%s》需要下载后才能阅读，共 %d 章。"),
+            _("《%s》共 %d 章，请选择下载内容。"),
             book.text or "", #chapters),
         buttons = {
             {
                 {
-                    text = _("开始下载"),
+                    text = _("仅下载正文"),
                     callback = function()
-                        UIManager:close(dialog)
-                        -- Progress, cancellation, error dialogs and the
-                        -- final open are all owned by the download
-                        -- pipeline inside the bridge.
-                        self.weread:downloadBook(book, chapters)
+                        startDownload(false)
                     end,
                 },
+                {
+                    text = _("正文及评论"),
+                    callback = function()
+                        startDownload(true)
+                    end,
+                },
+            },
+            {
                 {
                     text = _("取消"),
                     callback = function()
@@ -2909,6 +2925,15 @@ end
 -- present, otherwise fetch the chapter list and offer to download.
 function WeReadDesktop:openWereadBook(book, close_desktop)
     if not self.weread then
+        return
+    end
+    if self.book_download_runner
+        and self.book_download_runner:isActive(book.book_id) then
+        local state = self.book_download_runner:getState() or {}
+        local total = math.max(1, tonumber(state.total) or 1)
+        local percent = math.floor(100 * (tonumber(state.progress) or 0) / total)
+        self:showTransientInfo(string.format(
+            _("《%s》正在后台下载：%d%%"), book.text or "", percent), 2)
         return
     end
     local cached = self.weread:isBookDownloaded(book.book_id)
@@ -2946,6 +2971,25 @@ function WeReadDesktop:showBookDownloadOptions(book)
     if not self.weread then
         return
     end
+    if self.book_download_runner
+        and self.book_download_runner:isActive(book.book_id) then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        self:showOverlay(ConfirmBox:new{
+            modal = true,
+            text = string.format(
+                _("《%s》正在后台下载。\n\n取消后已完成章节仍会保留，可稍后补齐。"),
+                book.text or ""),
+            ok_text = _("取消下载"),
+            ok_callback = function()
+                if self.book_download_runner
+                    and self.book_download_runner:cancel(book.book_id) then
+                    self:showTransientInfo(_("正在取消下载…"), 2)
+                end
+            end,
+            cancel_text = _("继续下载"),
+        })
+        return
+    end
     if not self.weread:isLoggedIn() then
         self:showInfo(_("请先扫码登录微信读书"))
         return
@@ -2971,13 +3015,12 @@ function WeReadDesktop:showBookDownloadOptions(book)
                     return
                 end
                 if mode == "fill" then
-                    -- Nothing missing: the downloader says so itself.
-                    self.weread:downloadBook(book, chapters, nil, {
+                    self:confirmWereadDownload(book, chapters, {
                         fill_missing = true,
                         open_on_complete = false,
                     })
                 else
-                    self.weread:downloadBook(book, chapters)
+                    self:confirmWereadDownload(book, chapters)
                 end
             end)
         end)
@@ -3038,6 +3081,99 @@ function WeReadDesktop:showBookDownloadOptions(book)
         },
     }
     self:showOverlay(dialog)
+end
+
+function WeReadDesktop:updateBookDownloadState(state)
+    local widget = self.desktop_widget
+    if widget and widget.data then
+        widget.data.download_state = state
+    end
+    if self.book_download_repaint_task then return end
+    local task
+    task = function()
+        if self.book_download_repaint_task ~= task then return end
+        self.book_download_repaint_task = nil
+        if self.desktop_widget == widget and widget and widget.data then
+            widget:setData(widget.data)
+        end
+    end
+    self.book_download_repaint_task = task
+    UIManager:scheduleIn(0.75, task)
+end
+
+function WeReadDesktop:getBookDownloadRunner()
+    if self.book_download_runner
+        and self.book_download_runner.bridge == self.weread then
+        return self.book_download_runner
+    end
+    if self.book_download_runner then
+        self.book_download_runner:shutdown()
+    end
+    local BookDownloadRunner = require("weread.lib.book_download_runner")
+    self.book_download_runner = BookDownloadRunner:new{
+        bridge = self.weread,
+        on_state = function(state)
+            self:updateBookDownloadState(state)
+        end,
+        on_complete = function(ok, state)
+            if self.weread and self.weread.settings then
+                self.weread.settings:refresh("books")
+                self.weread:invalidateStorageSummary()
+            end
+            self:updateBookDownloadState(nil)
+            if ok then
+                local failed = tonumber(state.failed_chapters) or 0
+                if failed > 0 then
+                    self:showInfo(string.format(
+                        _("下载完成，但有 %d 章失败。长按书籍可补齐缺失章节。"),
+                        failed))
+                else
+                    self:showTransientInfo(_("书籍已下载完成"), 3)
+                end
+                self:refreshDesktop()
+            elseif state.status == "cancelled" then
+                self:showTransientInfo(_("下载已取消，已完成章节已保留"), 3)
+            else
+                local err = tostring(state.error or "")
+                if err:find("timeout", 1, true)
+                    or err:find("connection", 1, true)
+                    or err:find("network", 1, true) then
+                    self:showInfo(_("后台下载失败：网络连接异常，请检查网络后重试。"))
+                else
+                    self:showInfo(_("后台下载失败，可稍后重试或补齐缺失章节。"))
+                end
+            end
+        end,
+    }
+    return self.book_download_runner
+end
+
+function WeReadDesktop:startBackgroundBookDownload(book, chapters, options)
+    local runner = self:getBookDownloadRunner()
+    local started, err = runner:start(book, chapters, options)
+    if not started then
+        if err == "download_in_progress" then
+            self:showInfo(_("已有一本书正在后台下载，请等待完成或长按该书取消。"))
+        elseif err == "subprocess_unavailable" then
+            self:showInfo(_("当前 KOReader 环境不支持后台下载。"))
+        else
+            self:showInfo(_("后台下载未能启动，请稍后重试。"))
+        end
+        return false
+    end
+    self:showTransientInfo(_("已开始后台下载，可继续浏览书架"), 2)
+    return true
+end
+
+function WeReadDesktop:shutdownBookDownload()
+    if self.book_download_repaint_task then
+        UIManager:unschedule(self.book_download_repaint_task)
+        self.book_download_repaint_task = nil
+    end
+    if self.book_download_runner then
+        self.book_download_runner:shutdown()
+        self.book_download_runner = nil
+    end
 end
 
 -- Prompt a QR re-login when the web session is known to be dead (once
@@ -3342,6 +3478,8 @@ function WeReadDesktop:collectData()
             account_name = self.weread:getAccountName(),
             account_vid = self.weread:getAccountVid(),
             books = books,
+            download_state = self.book_download_runner
+                and self.book_download_runner:getState() or nil,
             shelf_query = self.shelf_query,
             shelf_sort_label = self:shelfSortLabel(),
             storage_label = storage_summary and string.format(

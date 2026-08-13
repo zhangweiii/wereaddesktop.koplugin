@@ -11,6 +11,7 @@ if not ok_json then
 end
 
 local DEFAULT_TIMEOUT_SECONDS = 15
+local DEFAULT_TOTAL_TIMEOUT_SECONDS = 60
 local Client = {}
 Client.__index = Client
 
@@ -249,12 +250,18 @@ function Client:request(opts)
         headers["Content-Length"] = tostring(#body)
     end
     local block_timeout = DEFAULT_TIMEOUT_SECONDS
-    local total_timeout = -1
+    -- A block timeout alone is not enough on an unstable connection: a peer
+    -- that keeps trickling bytes can keep the synchronous request alive
+    -- forever and make the download dialog appear frozen. Bound the complete
+    -- request as well; callers transferring unusually large files can still
+    -- override it with timeout = { block_seconds, total_seconds }.
+    local total_timeout = DEFAULT_TOTAL_TIMEOUT_SECONDS
     if type(opts.timeout) == "table" and opts.timeout[1] then
         block_timeout = opts.timeout[1]
         total_timeout = opts.timeout[2] or block_timeout
     elseif type(opts.timeout) == "number" then
         block_timeout = opts.timeout
+        total_timeout = math.max(total_timeout, block_timeout)
     end
     socketutil:set_timeout(block_timeout, total_timeout)
 
@@ -297,7 +304,9 @@ function Client:request(opts)
     if is_handle_cookie and opts.persist_response_cookies ~= false then
         local set_cookie = header_value(resp_headers, "set-cookie")
         if set_cookie then
-            self.settings:merge_set_cookie(set_cookie)
+            self.settings:merge_set_cookie(set_cookie, {
+                flush = self.persist_response_cookies ~= false,
+            })
         end
     end
 
@@ -493,7 +502,10 @@ function Client:renew_cookie()
     if wr_wrpa and wr_wrpa ~= "" then
         updates.wr_wrpa = wr_wrpa
     end
-    self.settings:update_auth(updates, { replace_cookies = true })
+    self.settings:update_auth(updates, {
+        replace_cookies = true,
+        flush = self.persist_response_cookies ~= false,
+    })
     return result, code, resp_headers
 end
 
